@@ -9,6 +9,8 @@ mod tunnel;
 mod reconnect;
 #[allow(dead_code)]
 mod session_integration;
+#[cfg(test)]
+mod harness_tests;
 mod http;
 mod mcp;
 mod ws;
