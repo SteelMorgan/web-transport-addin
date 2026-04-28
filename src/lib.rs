@@ -7,6 +7,8 @@ mod session_params;
 mod tunnel;
 #[allow(dead_code)]
 mod reconnect;
+#[allow(dead_code)]
+mod session_integration;
 mod http;
 mod mcp;
 mod ws;
