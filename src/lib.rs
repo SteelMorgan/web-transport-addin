@@ -1,18 +1,14 @@
 mod addin_error;
-#[allow(dead_code)]
 mod addin_host;
-#[allow(dead_code)]
 mod session_params;
-#[allow(dead_code)]
 mod tunnel;
-#[allow(dead_code)]
 mod reconnect;
-#[allow(dead_code)]
 mod session_integration;
 #[cfg(test)]
 mod harness_tests;
 mod http;
 mod mcp;
+mod session;
 mod ws;
 mod ws_client;
 use std::{
@@ -96,6 +92,14 @@ pub unsafe extern "C" fn GetClassObject(name: *const u16, component: *mut *mut c
                 0
             }
         }
+        "session" => {
+            let addin = session::SessionAddIn::new();
+            if let Ok(addin) = addin {
+                create_component(component, addin)
+            } else {
+                0
+            }
+        }
         _ => 0,
     }
 }
@@ -111,7 +115,7 @@ pub unsafe extern "C" fn DestroyObject(component: *mut *mut c_void) -> c_long {
 #[allow(non_snake_case)]
 #[no_mangle]
 pub extern "C" fn GetClassNames() -> *const u16 {
-    name!("ws|http|mcp").as_ptr()
+    name!("ws|http|mcp|session").as_ptr()
 }
 
 #[allow(non_snake_case)]
