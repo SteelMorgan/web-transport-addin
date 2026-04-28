@@ -32,7 +32,9 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::addin_host::AddinHost;
-use crate::reconnect::{run_with_reconnect, BackoffPolicy, Connector, FinalOutcome};
+use crate::reconnect::{
+    run_with_reconnect_correlated, BackoffPolicy, Connector, FinalOutcome,
+};
 use crate::tunnel::{OutboundSender, SendError, TextOrClose};
 
 /// Handle, который владеет фоновой задачей tunnel/reconnect.
@@ -54,11 +56,35 @@ impl SessionIntegration {
     where
         C: Connector + 'static,
     {
+        Self::start_with_connector_correlated(runtime, host, connector, policy, None)
+    }
+
+    /// Вариант [`start_with_connector`] с `correlation_id`, который при наличии
+    /// прокидывается во все входящие события: 1С получает конверт
+    /// `{correlation_id, payload}` вместо сырой строки. Этап 5.6.
+    pub fn start_with_connector_correlated<C>(
+        runtime: &RuntimeHandle,
+        host: Arc<dyn AddinHost>,
+        connector: C,
+        policy: BackoffPolicy,
+        correlation_id: Option<String>,
+    ) -> Self
+    where
+        C: Connector + 'static,
+    {
         let (outbound_tx, outbound_rx) = unbounded_channel::<String>();
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
         let task = runtime.spawn(async move {
-            run_with_reconnect(connector, host, outbound_rx, cancel_for_task, policy).await
+            run_with_reconnect_correlated(
+                connector,
+                host,
+                outbound_rx,
+                cancel_for_task,
+                policy,
+                correlation_id,
+            )
+            .await
         });
         Self {
             cancel,
@@ -75,6 +101,24 @@ impl SessionIntegration {
         policy: BackoffPolicy,
     ) -> Self {
         Self::start_with_connector(runtime, host, WsConnector::new(manager_url), policy)
+    }
+
+    /// Production‑API с прокидыванием `correlation_id` (см.
+    /// [`start_with_connector_correlated`]).
+    pub fn start_correlated(
+        runtime: &RuntimeHandle,
+        host: Arc<dyn AddinHost>,
+        manager_url: String,
+        policy: BackoffPolicy,
+        correlation_id: Option<String>,
+    ) -> Self {
+        Self::start_with_connector_correlated(
+            runtime,
+            host,
+            WsConnector::new(manager_url),
+            policy,
+            correlation_id,
+        )
     }
 
     /// Положить исходящий фрейм в очередь.

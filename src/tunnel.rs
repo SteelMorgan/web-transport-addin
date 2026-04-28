@@ -65,6 +65,33 @@ pub fn dispatch_incoming(payload: &str, host: &dyn AddinHost) -> bool {
     host.external_event(EVENT_INCOMING, payload)
 }
 
+/// Этап 5.6: доставка с конвертом `correlation_id`.
+///
+/// Когда сессия запущена с `correlation_id` (см. ADR‑0020 и
+/// `session_params`), tunnel оборачивает каждое входящее сообщение в
+/// JSON‑конверт:
+///
+/// ```json
+/// {"correlation_id":"<id>","payload":<original-text>}
+/// ```
+///
+/// `payload` остаётся **сырой строкой** менеджера (как правило, JSON
+/// JSON‑RPC‑объект) — оборачивание делается через `serde_json::Value::String`,
+/// чтобы не повторно парсить и не валидировать структуру manager'а в addin'е.
+/// 1С‑код после получения сам распаковывает поле `payload` и читает оттуда
+/// JSON‑RPC.
+pub fn dispatch_incoming_correlated(
+    payload: &str,
+    correlation_id: &str,
+    host: &dyn AddinHost,
+) -> bool {
+    let envelope = serde_json::json!({
+        "correlation_id": correlation_id,
+        "payload": payload,
+    });
+    host.external_event(EVENT_INCOMING, &envelope.to_string())
+}
+
 /// Главный pump tunnel'а.
 ///
 /// - `inbound` — поток фреймов от менеджера (адаптер уже свернул `Ping/Pong`
@@ -75,11 +102,27 @@ pub fn dispatch_incoming(payload: &str, host: &dyn AddinHost) -> bool {
 /// - `host` — addin‑хост, через который dispatch'ится `WS_INCOMING`;
 /// - `cancel` — токен для штатного шатдауна.
 pub async fn run_tunnel<R, W, EIn, EOut>(
+    inbound: R,
+    sink: W,
+    outbound: &mut mpsc::UnboundedReceiver<String>,
+    host: Arc<dyn AddinHost>,
+    cancel: CancellationToken,
+) -> RunOutcome
+where
+    R: Stream<Item = Result<TextOrClose, EIn>> + Unpin,
+    W: Sink<String, Error = EOut> + Unpin,
+{
+    run_tunnel_with_correlation(inbound, sink, outbound, host, cancel, None).await
+}
+
+/// Вариант [`run_tunnel`] с возможной обёрткой входящих в `correlation_id`-конверт.
+pub async fn run_tunnel_with_correlation<R, W, EIn, EOut>(
     mut inbound: R,
     sink: W,
     outbound: &mut mpsc::UnboundedReceiver<String>,
     host: Arc<dyn AddinHost>,
     cancel: CancellationToken,
+    correlation_id: Option<&str>,
 ) -> RunOutcome
 where
     R: Stream<Item = Result<TextOrClose, EIn>> + Unpin,
@@ -102,7 +145,10 @@ where
                     Some(Ok(TextOrClose::Text(payload))) => {
                         // Failure to deliver = переполнение очереди 1С;
                         // продолжаем pump, см. dispatch_incoming.
-                        let _ = dispatch_incoming(&payload, host.as_ref());
+                        let _ = match correlation_id {
+                            Some(cid) => dispatch_incoming_correlated(&payload, cid, host.as_ref()),
+                            None => dispatch_incoming(&payload, host.as_ref()),
+                        };
                     }
                     Some(Err(_)) => return RunOutcome::InboundError,
                 }
@@ -196,6 +242,52 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].0, EVENT_INCOMING);
         assert_eq!(evs[0].1, "{\"jsonrpc\":\"2.0\"}");
+    }
+
+    #[test]
+    fn dispatch_incoming_correlated_wraps_payload_in_envelope() {
+        let h = MockAddinHost::new();
+        let inner = "{\"jsonrpc\":\"2.0\",\"id\":1}";
+        assert!(dispatch_incoming_correlated(inner, "trace-7", &h));
+        let evs = h.events();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].0, EVENT_INCOMING);
+        let v: serde_json::Value = serde_json::from_str(&evs[0].1).unwrap();
+        assert_eq!(v["correlation_id"], "trace-7");
+        assert_eq!(v["payload"], inner);
+    }
+
+    #[tokio::test]
+    async fn pump_with_correlation_uses_envelope_for_each_frame() {
+        let h = host();
+        let frames: Vec<Result<TextOrClose, std::convert::Infallible>> = vec![
+            Ok(TextOrClose::Text("a".to_owned())),
+            Ok(TextOrClose::Text("b".to_owned())),
+            Ok(TextOrClose::Close),
+        ];
+        let inbound = stream::iter(frames);
+        let (sink_tx, _sink_rx) = unbounded_channel::<String>();
+        let sink = VecSink(sink_tx);
+        let (_outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
+        let cancel = CancellationToken::new();
+        let host_for_pump: Arc<dyn AddinHost> = h.clone();
+        let outcome = run_tunnel_with_correlation(
+            inbound,
+            sink,
+            &mut outbound_rx,
+            host_for_pump,
+            cancel,
+            Some("trace-x"),
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Closed);
+        let evs = h.events();
+        assert_eq!(evs.len(), 2);
+        for (i, payload) in ["a", "b"].iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(&evs[i].1).unwrap();
+            assert_eq!(v["correlation_id"], "trace-x");
+            assert_eq!(v["payload"], *payload);
+        }
     }
 
     #[test]
