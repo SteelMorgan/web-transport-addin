@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::addin_host::AddinHost;
-use crate::tunnel::{run_tunnel, RunOutcome, TextOrClose};
+use crate::tunnel::{run_tunnel_with_correlation, RunOutcome, TextOrClose};
 
 /// Имя внешнего события 1С для смены состояния канала.
 pub const EVENT_RECONNECT_STATE: &str = "WS_RECONNECT_STATE";
@@ -123,9 +123,25 @@ impl StateEmitter {
 pub async fn run_with_reconnect<C>(
     connector: C,
     host: Arc<dyn AddinHost>,
+    outbound: mpsc::UnboundedReceiver<String>,
+    cancel: CancellationToken,
+    policy: BackoffPolicy,
+) -> FinalOutcome
+where
+    C: Connector,
+{
+    run_with_reconnect_correlated(connector, host, outbound, cancel, policy, None).await
+}
+
+/// Вариант [`run_with_reconnect`] с `correlation_id`, который пробрасывается
+/// в каждое входящее событие через [`tunnel::dispatch_incoming_correlated`].
+pub async fn run_with_reconnect_correlated<C>(
+    connector: C,
+    host: Arc<dyn AddinHost>,
     mut outbound: mpsc::UnboundedReceiver<String>,
     cancel: CancellationToken,
     policy: BackoffPolicy,
+    correlation_id: Option<String>,
 ) -> FinalOutcome
 where
     C: Connector,
@@ -152,8 +168,15 @@ where
                 attempt = 0; // перезапускаем счётчик на следующую серию неудач
                 emitter.connected();
 
-                let outcome =
-                    run_tunnel(inbound, sink, &mut outbound, host.clone(), cancel.clone()).await;
+                let outcome = run_tunnel_with_correlation(
+                    inbound,
+                    sink,
+                    &mut outbound,
+                    host.clone(),
+                    cancel.clone(),
+                    correlation_id.as_deref(),
+                )
+                .await;
 
                 let reason = match outcome {
                     RunOutcome::Cancelled => return FinalOutcome::Cancelled,
