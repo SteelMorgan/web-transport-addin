@@ -77,7 +77,7 @@ pub fn dispatch_incoming(payload: &str, host: &dyn AddinHost) -> bool {
 pub async fn run_tunnel<R, W, EIn, EOut>(
     mut inbound: R,
     sink: W,
-    mut outbound: mpsc::UnboundedReceiver<String>,
+    outbound: &mut mpsc::UnboundedReceiver<String>,
     host: Arc<dyn AddinHost>,
     cancel: CancellationToken,
 ) -> RunOutcome
@@ -216,12 +216,12 @@ mod tests {
         let inbound = stream::iter(frames);
         let (sink_tx, _sink_rx) = unbounded_channel::<String>();
         let sink = VecSink(sink_tx);
-        let (_outbound_tx, outbound_rx) = unbounded_channel::<String>();
+        let (_outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
         let cancel = CancellationToken::new();
 
         let host_for_pump: Arc<dyn AddinHost> = h.clone();
         let outcome =
-            run_tunnel(inbound, sink, outbound_rx, host_for_pump, cancel).await;
+            run_tunnel(inbound, sink, &mut outbound_rx, host_for_pump, cancel).await;
         assert_eq!(outcome, RunOutcome::Closed);
 
         let evs = h.events();
@@ -237,7 +237,7 @@ mod tests {
         let inbound = stream::pending::<Result<TextOrClose, Infallible>>();
         let (sink_tx, mut sink_rx) = unbounded_channel::<String>();
         let sink = VecSink(sink_tx);
-        let (outbound_tx, outbound_rx) = unbounded_channel::<String>();
+        let (outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
         let cancel = CancellationToken::new();
 
         outbound_tx.send("ping".to_owned()).unwrap();
@@ -246,7 +246,7 @@ mod tests {
         let host_for_pump: Arc<dyn AddinHost> = h.clone();
         let cancel_clone = cancel.clone();
         let pump = tokio::spawn(async move {
-            run_tunnel(inbound, sink, outbound_rx, host_for_pump, cancel_clone).await
+            run_tunnel(inbound, sink, &mut outbound_rx, host_for_pump, cancel_clone).await
         });
 
         // Дать pump'у обработать оба сообщения, затем завершить.
@@ -274,12 +274,12 @@ mod tests {
         let inbound = stream::iter(frames);
         let (sink_tx, _sink_rx) = unbounded_channel::<String>();
         let sink = VecSink(sink_tx);
-        let (_outbound_tx, outbound_rx) = unbounded_channel::<String>();
+        let (_outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
         let cancel = CancellationToken::new();
 
         let host_for_pump: Arc<dyn AddinHost> = h.clone();
         let outcome =
-            run_tunnel(inbound, sink, outbound_rx, host_for_pump, cancel).await;
+            run_tunnel(inbound, sink, &mut outbound_rx, host_for_pump, cancel).await;
         assert_eq!(outcome, RunOutcome::InboundError);
         // Первое сообщение должно было успеть пройти.
         assert_eq!(h.events().len(), 1);
@@ -291,14 +291,14 @@ mod tests {
         let inbound = stream::pending::<Result<TextOrClose, Infallible>>();
         let (sink_tx, _sink_rx) = unbounded_channel::<String>();
         let sink = VecSink(sink_tx);
-        let (outbound_tx, outbound_rx) = unbounded_channel::<String>();
+        let (outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
         let cancel = CancellationToken::new();
 
         drop(outbound_tx);
 
         let host_for_pump: Arc<dyn AddinHost> = h.clone();
         let outcome =
-            run_tunnel(inbound, sink, outbound_rx, host_for_pump, cancel).await;
+            run_tunnel(inbound, sink, &mut outbound_rx, host_for_pump, cancel).await;
         assert_eq!(outcome, RunOutcome::OutboundDropped);
     }
 
@@ -315,12 +315,12 @@ mod tests {
         let inbound = stream::iter(frames);
         let (sink_tx, _sink_rx) = unbounded_channel::<String>();
         let sink = VecSink(sink_tx);
-        let (_outbound_tx, outbound_rx) = unbounded_channel::<String>();
+        let (_outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
         let cancel = CancellationToken::new();
 
         let host_for_pump: Arc<dyn AddinHost> = h.clone();
         let outcome =
-            run_tunnel(inbound, sink, outbound_rx, host_for_pump, cancel).await;
+            run_tunnel(inbound, sink, &mut outbound_rx, host_for_pump, cancel).await;
         assert_eq!(outcome, RunOutcome::Closed);
         assert!(h.events().is_empty());
     }

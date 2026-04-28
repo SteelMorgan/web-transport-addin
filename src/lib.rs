@@ -5,6 +5,8 @@ mod addin_host;
 mod session_params;
 #[allow(dead_code)]
 mod tunnel;
+#[allow(dead_code)]
+mod reconnect;
 mod http;
 mod mcp;
 mod ws;
