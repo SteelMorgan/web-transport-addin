@@ -3,6 +3,8 @@ mod addin_error;
 mod addin_host;
 #[allow(dead_code)]
 mod session_params;
+#[allow(dead_code)]
+mod tunnel;
 mod http;
 mod mcp;
 mod ws;
