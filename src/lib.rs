@@ -1,4 +1,6 @@
 mod addin_error;
+#[allow(dead_code)]
+mod addin_host;
 mod http;
 mod mcp;
 mod ws;
