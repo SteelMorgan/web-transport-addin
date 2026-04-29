@@ -31,7 +31,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::addin_host::AddinHost;
-use crate::tunnel::{run_tunnel_with_correlation, RunOutcome, TextOrClose};
+use crate::tunnel::{run_tunnel_with_correlation, OutboundSender, RunOutcome, TextOrClose};
+use crate::system_capability::Registry;
 
 /// Имя внешнего события 1С для смены состояния канала.
 pub const EVENT_RECONNECT_STATE: &str = "WS_RECONNECT_STATE";
@@ -130,11 +131,17 @@ pub async fn run_with_reconnect<C>(
 where
     C: Connector,
 {
-    run_with_reconnect_correlated(connector, host, outbound, cancel, policy, None).await
+    run_with_reconnect_correlated(connector, host, outbound, cancel, policy, None, None).await
 }
 
 /// Вариант [`run_with_reconnect`] с `correlation_id`, который пробрасывается
-/// в каждое входящее событие через [`tunnel::dispatch_incoming_correlated`].
+/// в каждое входящее событие через [`tunnel::dispatch_incoming_correlated`],
+/// и опциональным `system_capability` для роутинга `addin.*`-методов.
+///
+/// `system_capability` — `Option<(Registry, OutboundSender)>`:
+/// - `None` — все входящие идут в `external_event` (обратная совместимость).
+/// - `Some(...)` — на каждом reconnect-итерации пара клонируется и передаётся
+///   в `run_tunnel_with_correlation`, registry переживает reconnect.
 pub async fn run_with_reconnect_correlated<C>(
     connector: C,
     host: Arc<dyn AddinHost>,
@@ -142,6 +149,7 @@ pub async fn run_with_reconnect_correlated<C>(
     cancel: CancellationToken,
     policy: BackoffPolicy,
     correlation_id: Option<String>,
+    system_capability: Option<(Registry, OutboundSender)>,
 ) -> FinalOutcome
 where
     C: Connector,
@@ -156,6 +164,11 @@ where
 
         attempt = attempt.saturating_add(1);
         emitter.connecting(attempt);
+        // Async-yield после emit'а — на Linux 1С 8.3.27 платформа теряет
+        // быстрые подряд external_event из background-потока tokio runtime,
+        // если между ними не было передачи управления планировщику. См.
+        // `feedback_addin_external_event_linux.md` в memory.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let connect_result = tokio::select! {
             biased;
@@ -167,6 +180,13 @@ where
             Ok((inbound, sink)) => {
                 attempt = 0; // перезапускаем счётчик на следующую серию неудач
                 emitter.connected();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Клонируем sys_cap для этой итерации tunnel'а; registry — Arc,
+                // поэтому переживает reconnect и сохраняет дочерние процессы.
+                let sys_cap_for_tunnel = system_capability
+                    .as_ref()
+                    .map(|(r, o)| (r.clone(), o.clone()));
 
                 let outcome = run_tunnel_with_correlation(
                     inbound,
@@ -175,6 +195,7 @@ where
                     host.clone(),
                     cancel.clone(),
                     correlation_id.as_deref(),
+                    sys_cap_for_tunnel,
                 )
                 .await;
 
@@ -182,6 +203,7 @@ where
                     RunOutcome::Cancelled => return FinalOutcome::Cancelled,
                     RunOutcome::OutboundDropped => {
                         emitter.disconnected("OutboundDropped");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         return FinalOutcome::OutboundDropped;
                     }
                     RunOutcome::Closed => "Closed",
@@ -189,14 +211,17 @@ where
                     RunOutcome::SinkError => "SinkError",
                 };
                 emitter.disconnected(reason);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 // переход к новой попытке connect — без backoff,
                 // потому что attempt сброшен и delay_for(1) применится ниже.
             }
             Err(err) => {
                 emitter.disconnected(&format!("ConnectError: {err:?}"));
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if let Some(max) = policy.max_attempts {
                     if attempt >= max {
                         emitter.give_up("max attempts exceeded");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         return FinalOutcome::GiveUp;
                     }
                 }
@@ -385,8 +410,9 @@ mod tests {
             run_with_reconnect(connector, host_dyn, outbound, cancel_clone, policy).await
         });
 
-        // Дать достаточно времени на цикл reconnect.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Дать достаточно времени на цикл reconnect (включая 100мс
+        // async-sleep'ы между emit'ами в `run_with_reconnect_correlated`).
+        tokio::time::sleep(Duration::from_millis(500)).await;
         cancel.cancel();
         let outcome = pump.await.unwrap();
         assert_eq!(outcome, FinalOutcome::Cancelled);

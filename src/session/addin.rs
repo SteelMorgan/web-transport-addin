@@ -31,7 +31,7 @@ use crate::addin_error::report_platform_error;
 use crate::addin_host::{AddinHost, RealAddinHost};
 use crate::reconnect::BackoffPolicy;
 use crate::session_integration::SessionIntegration;
-use crate::session_params::{resolve, ResolveInput};
+use crate::session_params::{resolve_default, ResolveInput};
 use crate::VERSION;
 
 pub struct SessionAddIn {
@@ -60,7 +60,7 @@ impl SessionAddIn {
             startup_param: startup_param.get_string()?,
             client_uid: client_uid.get_string()?,
         };
-        let params = resolve(&input);
+        let params = resolve_default(&input);
         return_value.set_str1c(params.to_json())?;
         Ok(())
     }

@@ -1,6 +1,6 @@
 //! Резолвер параметров клиентской сессии для подключения к session-manager.
 //!
-//! Контракт зафиксирован в `v8-client-session-manager` ADR-0020:
+//! Контракт зафиксирован в `v8-client-session-manager` ADR-0020 / ADR-0029:
 //!
 //! - `manager_url` — из константы расширения `WebTransportSessionManagerURL`;
 //!   если константа пуста — fallback на default `ws://127.0.0.1:4000/sessions`;
@@ -13,6 +13,10 @@
 //!   `RunYaXUnit` → `yaxunit_runner`, иначе → `client`.
 //! - `correlation_id` — напрямую из `/C"correlation_id=..."`; если нет —
 //!   `None`.
+//! - `host_id` — приоритет: env `V8_HOST_ID` → `gethostname` → `"unknown"`.
+//!   ADR-0029.
+//! - `pid` — `std::process::id()`. ADR-0029.
+//! - `capabilities` — `["spawn", "kill"]`. ADR-0029.
 //!
 //! Парсер `ПараметрЗапуска` (`StartupParameter`) умышленно живёт здесь, в
 //! Rust, а не в БСП‑обёртке: это снимает завязку реализации на конкретный
@@ -33,6 +37,9 @@ pub const DEFAULT_MANAGER_URL: &str = "ws://127.0.0.1:4000/sessions";
 /// Используется только для документации/логов — чтение идёт на стороне 1С.
 pub const MANAGER_URL_CONSTANT: &str = "WebTransportSessionManagerURL";
 
+/// Имя переменной окружения для явного override `host_id` (ADR-0029).
+pub const HOST_ID_ENV: &str = "V8_HOST_ID";
+
 /// Известные значения `kind`, которые менеджер ожидает в `session.register`.
 pub mod kinds {
     pub const CLIENT: &str = "client";
@@ -40,6 +47,62 @@ pub mod kinds {
     pub const VANESSA_TEST_CLIENT: &str = "vanessa_test_client";
     pub const YAXUNIT_RUNNER: &str = "yaxunit_runner";
 }
+
+// ─── HostInfoProvider trait ────────────────────────────────────────────────
+
+/// Абстракция над источниками host/pid для детерминированного тестирования.
+/// Продакшн-реализация — [`OsHostInfo`], тестовая — [`MockHostInfo`].
+pub trait HostInfoProvider {
+    /// Возвращает `host_id`. Приоритет: env `V8_HOST_ID` → gethostname → `"unknown"`.
+    fn host_id(&self) -> String;
+    /// Возвращает PID текущего процесса.
+    fn pid(&self) -> u32;
+}
+
+/// Продакшн-реализация [`HostInfoProvider`]: читает env и ОС.
+pub struct OsHostInfo;
+
+impl HostInfoProvider for OsHostInfo {
+    fn host_id(&self) -> String {
+        // Приоритет 1: явный override через env.
+        if let Ok(val) = std::env::var(HOST_ID_ENV) {
+            let trimmed = val.trim().to_owned();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+        // Приоритет 2: gethostname.
+        let name = gethostname::gethostname().to_string_lossy().to_string();
+        if !name.is_empty() {
+            return name;
+        }
+        // Fallback.
+        "unknown".to_owned()
+    }
+
+    fn pid(&self) -> u32 {
+        std::process::id()
+    }
+}
+
+/// Тестовая реализация [`HostInfoProvider`] с фиксированными значениями.
+#[cfg(test)]
+pub struct MockHostInfo {
+    pub host_id: String,
+    pub pid: u32,
+}
+
+#[cfg(test)]
+impl HostInfoProvider for MockHostInfo {
+    fn host_id(&self) -> String {
+        self.host_id.clone()
+    }
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+// ─── ResolveInput / SessionParams ──────────────────────────────────────────
 
 /// Срез входных данных, которые 1С‑адаптер передаёт в резолвер.
 #[derive(Debug, Clone, Default)]
@@ -60,7 +123,7 @@ pub struct ResolveInput {
     pub client_uid: String,
 }
 
-/// Результат резолва.
+/// Результат резолва (ADR-0020, ADR-0029).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionParams {
     pub manager_url: String,
@@ -69,10 +132,16 @@ pub struct SessionParams {
     /// `None`, если `correlation_id=` не задан в `/C`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    /// Идентификатор хоста, в котором работает addin (ADR-0029).
+    pub host_id: String,
+    /// PID процесса 1cv8c, в который загружен addin (ADR-0029).
+    pub pid: u32,
+    /// Capabilities, поддерживаемые этим экземпляром addin (ADR-0029).
+    pub capabilities: Vec<String>,
 }
 
 impl SessionParams {
-    /// JSON‑сериализация для возврата 1С‑коду через addin (см. ADR‑0020).
+    /// JSON‑сериализация для возврата 1С‑коду через addin (см. ADR‑0020 / ADR-0029).
     pub fn to_json(&self) -> String {
         // Поля заведомо валидный UTF‑8 без управляющих символов; serde_json
         // никогда здесь не падает.
@@ -86,9 +155,9 @@ pub fn fresh_client_uid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Главный резолвер. Не имеет побочных эффектов и не читает окружение —
-/// все источники приходят на вход через [`ResolveInput`].
-pub fn resolve(input: &ResolveInput) -> SessionParams {
+/// Главный резолвер. Принимает `&dyn HostInfoProvider` для детерминированного
+/// тестирования. В продакшн-коде используй [`resolve_default`].
+pub fn resolve(input: &ResolveInput, host_info: &dyn HostInfoProvider) -> SessionParams {
     let manager_url = if input.constant_url.trim().is_empty() {
         DEFAULT_MANAGER_URL.to_owned()
     } else {
@@ -115,7 +184,15 @@ pub fn resolve(input: &ResolveInput) -> SessionParams {
         client_uid,
         kind,
         correlation_id,
+        host_id: host_info.host_id(),
+        pid: host_info.pid(),
+        capabilities: vec!["spawn".into(), "kill".into()],
     }
+}
+
+/// Удобная обёртка над [`resolve`], использующая [`OsHostInfo`] (продакшн).
+pub fn resolve_default(input: &ResolveInput) -> SessionParams {
+    resolve(input, &OsHostInfo)
 }
 
 /// Парсер строки вида `key=value key=value` (значения без пробелов и кавычек,
@@ -150,6 +227,13 @@ pub fn infer_kind(launch_string: &str) -> String {
 mod tests {
     use super::*;
 
+    fn mock() -> MockHostInfo {
+        MockHostInfo {
+            host_id: "test-host".into(),
+            pid: 12345,
+        }
+    }
+
     fn input(constant: &str, launch: &str, startup: &str, uid: &str) -> ResolveInput {
         ResolveInput {
             constant_url: constant.to_owned(),
@@ -159,46 +243,50 @@ mod tests {
         }
     }
 
+    fn resolve_t(inp: &ResolveInput) -> SessionParams {
+        resolve(inp, &mock())
+    }
+
     #[test]
     fn empty_constant_falls_back_to_default_url() {
-        let p = resolve(&input("", "", "", "uid-1"));
+        let p = resolve_t(&input("", "", "", "uid-1"));
         assert_eq!(p.manager_url, DEFAULT_MANAGER_URL);
     }
 
     #[test]
     fn whitespace_constant_treated_as_empty() {
-        let p = resolve(&input("   ", "", "", "uid-1"));
+        let p = resolve_t(&input("   ", "", "", "uid-1"));
         assert_eq!(p.manager_url, DEFAULT_MANAGER_URL);
     }
 
     #[test]
     fn explicit_constant_wins() {
-        let p = resolve(&input("ws://10.0.0.5:4000/sessions", "", "", "uid-1"));
+        let p = resolve_t(&input("ws://10.0.0.5:4000/sessions", "", "", "uid-1"));
         assert_eq!(p.manager_url, "ws://10.0.0.5:4000/sessions");
     }
 
     #[test]
     fn manager_url_in_startup_param_is_ignored() {
         // По ADR‑0020 ключ manager_url=... в /C явно вне контракта.
-        let p = resolve(&input("", "", "manager_url=ws://hijack/", "uid-1"));
+        let p = resolve_t(&input("", "", "manager_url=ws://hijack/", "uid-1"));
         assert_eq!(p.manager_url, DEFAULT_MANAGER_URL);
     }
 
     #[test]
     fn kind_inferred_from_testmanager_flag() {
-        let p = resolve(&input("", "DESIGNER /TESTMANAGER", "", "uid-1"));
+        let p = resolve_t(&input("", "DESIGNER /TESTMANAGER", "", "uid-1"));
         assert_eq!(p.kind, kinds::VANESSA_MANAGER);
     }
 
     #[test]
     fn kind_inferred_from_testclient_flag_case_insensitive() {
-        let p = resolve(&input("", "1cv8c /testclient -port=12345", "", "uid-1"));
+        let p = resolve_t(&input("", "1cv8c /testclient -port=12345", "", "uid-1"));
         assert_eq!(p.kind, kinds::VANESSA_TEST_CLIENT);
     }
 
     #[test]
     fn kind_inferred_from_runyaxunit_in_command_line() {
-        let p = resolve(&input(
+        let p = resolve_t(&input(
             "",
             "1cv8c ENTERPRISE /Sserver /CRunYaXUnit",
             "",
@@ -209,14 +297,14 @@ mod tests {
 
     #[test]
     fn kind_defaults_to_client() {
-        let p = resolve(&input("", "1cv8c ENTERPRISE", "", "uid-1"));
+        let p = resolve_t(&input("", "1cv8c ENTERPRISE", "", "uid-1"));
         assert_eq!(p.kind, kinds::CLIENT);
     }
 
     #[test]
     fn kind_override_from_startup_param_beats_heuristic() {
         // /TESTMANAGER в launch, но override через /C"kind=..." должен победить.
-        let p = resolve(&input(
+        let p = resolve_t(&input(
             "",
             "DESIGNER /TESTMANAGER",
             "kind=yaxunit_runner",
@@ -227,25 +315,25 @@ mod tests {
 
     #[test]
     fn empty_kind_override_keeps_heuristic() {
-        let p = resolve(&input("", "DESIGNER /TESTMANAGER", "kind=", "uid-1"));
+        let p = resolve_t(&input("", "DESIGNER /TESTMANAGER", "kind=", "uid-1"));
         assert_eq!(p.kind, kinds::VANESSA_MANAGER);
     }
 
     #[test]
     fn correlation_id_extracted_from_startup_param() {
-        let p = resolve(&input("", "", "correlation_id=trace-42", "uid-1"));
+        let p = resolve_t(&input("", "", "correlation_id=trace-42", "uid-1"));
         assert_eq!(p.correlation_id.as_deref(), Some("trace-42"));
     }
 
     #[test]
     fn correlation_id_absent_yields_none() {
-        let p = resolve(&input("", "", "kind=client", "uid-1"));
+        let p = resolve_t(&input("", "", "kind=client", "uid-1"));
         assert!(p.correlation_id.is_none());
     }
 
     #[test]
     fn multiple_startup_pairs_parsed_independently() {
-        let p = resolve(&input(
+        let p = resolve_t(&input(
             "",
             "DESIGNER",
             "correlation_id=trace-7 kind=vanessa_manager other=ignored",
@@ -270,7 +358,7 @@ mod tests {
 
     #[test]
     fn empty_client_uid_generates_fresh_uuid_v4() {
-        let p = resolve(&input("", "", "", ""));
+        let p = resolve_t(&input("", "", "", ""));
         // Формат UUID v4: 36 символов с дефисами в правильных позициях.
         assert_eq!(p.client_uid.len(), 36);
         assert_eq!(p.client_uid.as_bytes()[8], b'-');
@@ -279,7 +367,7 @@ mod tests {
 
     #[test]
     fn provided_client_uid_passes_through() {
-        let p = resolve(&input("", "", "", "custom-uid"));
+        let p = resolve_t(&input("", "", "", "custom-uid"));
         assert_eq!(p.client_uid, "custom-uid");
     }
 
@@ -297,6 +385,9 @@ mod tests {
             client_uid: "uid-1".to_owned(),
             kind: "client".to_owned(),
             correlation_id: None,
+            host_id: "test-host".into(),
+            pid: 12345,
+            capabilities: vec!["spawn".into(), "kill".into()],
         };
         let json = p.to_json();
         assert!(!json.contains("correlation_id"));
@@ -311,6 +402,9 @@ mod tests {
             client_uid: "uid-2".to_owned(),
             kind: "vanessa_manager".to_owned(),
             correlation_id: Some("trace-9".to_owned()),
+            host_id: "test-host".into(),
+            pid: 12345,
+            capabilities: vec!["spawn".into(), "kill".into()],
         };
         let json = p.to_json();
         assert!(json.contains("\"correlation_id\":\"trace-9\""));
@@ -319,7 +413,7 @@ mod tests {
     #[test]
     fn end_to_end_realistic_yaxunit_runner_invocation() {
         // Менеджер спавнит yaxunit_runner: kind override + correlation_id.
-        let p = resolve(&input(
+        let p = resolve_t(&input(
             "ws://onec-infra:4000/sessions",
             "1cv8c ENTERPRISE /Sserver /CRunYaXUnit",
             "correlation_id=spawn-42 kind=yaxunit_runner",
@@ -329,5 +423,56 @@ mod tests {
         assert_eq!(p.kind, "yaxunit_runner");
         assert_eq!(p.correlation_id.as_deref(), Some("spawn-42"));
         assert_eq!(p.client_uid, "fixed-uid-7");
+    }
+
+    // ─── Новые тесты для ADR-0029 ────────────────────────────────────────
+
+    #[test]
+    fn host_id_from_mock_appears_in_params() {
+        let p = resolve_t(&input("", "", "", "uid-1"));
+        assert_eq!(p.host_id, "test-host");
+    }
+
+    #[test]
+    fn pid_from_mock_appears_in_params() {
+        let p = resolve_t(&input("", "", "", "uid-1"));
+        assert_eq!(p.pid, 12345u32);
+    }
+
+    #[test]
+    fn capabilities_serialized_as_string_array() {
+        let p = resolve_t(&input("", "", "", "uid-1"));
+        let json = p.to_json();
+        assert!(json.contains("\"capabilities\":[\"spawn\",\"kill\"]"));
+    }
+
+    #[test]
+    fn host_id_json_field_present() {
+        let p = resolve_t(&input("", "", "", "uid-1"));
+        let json = p.to_json();
+        assert!(json.contains("\"host_id\":\"test-host\""));
+    }
+
+    #[test]
+    fn pid_json_field_present() {
+        let p = resolve_t(&input("", "", "", "uid-1"));
+        let json = p.to_json();
+        assert!(json.contains("\"pid\":12345"));
+    }
+
+    #[test]
+    fn v8_host_id_env_override_wins_over_gethostname() {
+        // Устанавливаем env, вызываем OsHostInfo, убираем env.
+        std::env::set_var(HOST_ID_ENV, "custom-env-host");
+        let result = OsHostInfo.host_id();
+        std::env::remove_var(HOST_ID_ENV);
+        assert_eq!(result, "custom-env-host");
+    }
+
+    #[test]
+    fn gethostname_returns_nonempty_string() {
+        // Sanity-check: gethostname должен вернуть непустое имя.
+        let name = gethostname::gethostname().to_string_lossy().to_string();
+        assert!(!name.is_empty(), "gethostname returned empty string");
     }
 }

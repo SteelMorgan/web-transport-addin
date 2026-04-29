@@ -35,6 +35,7 @@ use crate::addin_host::AddinHost;
 use crate::reconnect::{
     run_with_reconnect_correlated, BackoffPolicy, Connector, FinalOutcome,
 };
+use crate::system_capability::new_registry;
 use crate::tunnel::{OutboundSender, SendError, TextOrClose};
 
 /// Handle, который владеет фоновой задачей tunnel/reconnect.
@@ -75,6 +76,13 @@ impl SessionIntegration {
         let (outbound_tx, outbound_rx) = unbounded_channel::<String>();
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
+
+        // Создать supervisor registry один раз на интеграцию (per-integration,
+        // не global). Registry — Arc, переживает reconnect; дочерние процессы
+        // не теряются при разрыве WS-соединения.
+        let registry = new_registry();
+        let sys_cap = Some((registry, OutboundSender::new(outbound_tx.clone())));
+
         let task = runtime.spawn(async move {
             run_with_reconnect_correlated(
                 connector,
@@ -83,6 +91,7 @@ impl SessionIntegration {
                 cancel_for_task,
                 policy,
                 correlation_id,
+                sys_cap,
             )
             .await
         });
@@ -156,7 +165,25 @@ impl Connector for WsConnector {
     fn connect(&self) -> Self::ConnectFut {
         let url = self.url.clone();
         Box::pin(async move {
-            let (ws, _resp) = connect_async(&url).await?;
+            // Защита от зависания HTTP/upgrade (tokio_tungstenite на некоторых
+            // транспортах вроде Docker Desktop vpnkit может не дочитать ответ
+            // 101 и висеть в `connect_async` бесконечно). 5 секунд ≫ обычного
+            // RTT и времени upgrade'а; превышение — явный сигнал к ретраю.
+            let connect_fut = connect_async(&url);
+            let (ws, _resp) = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                connect_fut,
+            )
+            .await
+            {
+                Ok(res) => res?,
+                Err(_) => {
+                    return Err(WsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connect_async timed out (5s)",
+                    )));
+                }
+            };
             let (sink, stream) = ws.split();
             Ok((WsStreamAdapter { inner: stream }, WsSinkAdapter { inner: sink }))
         })
@@ -344,8 +371,9 @@ mod tests {
             policy,
         );
 
-        // Дать pump'у обработать входящее сообщение.
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Дать pump'у обработать входящее сообщение (включая 100мс
+        // async-sleep'ы между emit'ами connecting/connected в reconnect.rs).
+        tokio::time::sleep(Duration::from_millis(400)).await;
 
         // Слать исходящее в активную сессию (вторая Step::OkPending уже стала текущей,
         // но первая сессия закрылась после Ok(frames)+иссякания → reconnect → второй sink_tx).

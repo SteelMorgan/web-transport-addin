@@ -4,6 +4,7 @@ mod session_params;
 mod tunnel;
 mod reconnect;
 mod session_integration;
+pub mod system_capability;
 #[cfg(test)]
 mod harness_tests;
 mod http;
@@ -20,7 +21,7 @@ use std::{
 
 use addin1c::{create_component, destroy_component, name, AttachType};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = "0.6.6";
 
 pub(crate) fn parse_headers(
     json_headers: String,

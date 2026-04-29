@@ -112,10 +112,17 @@ where
     R: Stream<Item = Result<TextOrClose, EIn>> + Unpin,
     W: Sink<String, Error = EOut> + Unpin,
 {
-    run_tunnel_with_correlation(inbound, sink, outbound, host, cancel, None).await
+    run_tunnel_with_correlation(inbound, sink, outbound, host, cancel, None, None).await
 }
 
-/// Вариант [`run_tunnel`] с возможной обёрткой входящих в `correlation_id`-конверт.
+/// Вариант [`run_tunnel`] с возможной обёрткой входящих в `correlation_id`-конверт
+/// и опциональным роутингом `addin.*`-методов через `system_capability`.
+///
+/// Параметр `system_capability`:
+/// - `None` — все входящие идут в `external_event` (обратная совместимость).
+/// - `Some((registry, outbound_tx))` — перед `external_event` вызывается
+///   [`crate::system_capability::try_dispatch_addin_method`]; если он возвращает
+///   `true` — фрейм уже обработан, `external_event` не вызывается.
 pub async fn run_tunnel_with_correlation<R, W, EIn, EOut>(
     mut inbound: R,
     sink: W,
@@ -123,6 +130,7 @@ pub async fn run_tunnel_with_correlation<R, W, EIn, EOut>(
     host: Arc<dyn AddinHost>,
     cancel: CancellationToken,
     correlation_id: Option<&str>,
+    system_capability: Option<(crate::system_capability::Registry, OutboundSender)>,
 ) -> RunOutcome
 where
     R: Stream<Item = Result<TextOrClose, EIn>> + Unpin,
@@ -143,6 +151,17 @@ where
                     None => return RunOutcome::Closed,
                     Some(Ok(TextOrClose::Close)) => return RunOutcome::Closed,
                     Some(Ok(TextOrClose::Text(payload))) => {
+                        // Попытаться роутировать как addin.* метод.
+                        // Если роутировано — handler сам отправит ответ через outbound_tx.
+                        if let Some((ref registry, ref outbound_tx)) = system_capability {
+                            if crate::system_capability::try_dispatch_addin_method(
+                                &payload,
+                                registry.clone(),
+                                outbound_tx.clone(),
+                            ) {
+                                continue;
+                            }
+                        }
                         // Failure to deliver = переполнение очереди 1С;
                         // продолжаем pump, см. dispatch_incoming.
                         let _ = match correlation_id {
@@ -278,6 +297,7 @@ mod tests {
             host_for_pump,
             cancel,
             Some("trace-x"),
+            None,
         )
         .await;
         assert_eq!(outcome, RunOutcome::Closed);
@@ -423,5 +443,106 @@ mod tests {
         let s = OutboundSender::new(tx);
         drop(rx);
         assert_eq!(s.send("x".to_owned()), Err(SendError::Closed));
+    }
+
+    // ── system_capability integration ───────────────────────────────────────
+
+    /// `addin.spawn` payload: роутируется в outbound (ответ с pid),
+    /// `external_event` (MockAddinHost) НЕ вызывается для этого фрейма.
+    #[tokio::test]
+    async fn addin_spawn_payload_routed_to_outbound_not_external_event() {
+        let h = host();
+        // addin.spawn с реальным binary=sleep, чтобы получить pid в ответе.
+        let spawn_payload = r#"{"jsonrpc":"2.0","method":"addin.spawn","id":1,"params":{"launch_spec":{"binary":"sleep","args":["0.05"]},"expected_uid":"u1"}}"#;
+        let frames: Vec<Result<TextOrClose, Infallible>> = vec![
+            Ok(TextOrClose::Text(spawn_payload.to_owned())),
+            Ok(TextOrClose::Close),
+        ];
+        let inbound = stream::iter(frames);
+        let (sink_tx, _sink_rx) = unbounded_channel::<String>();
+        let sink = VecSink(sink_tx);
+        let (_outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
+        let cancel = CancellationToken::new();
+
+        // Создаём отдельный канал для ответов system_capability.
+        let (syscap_tx, mut syscap_rx) = unbounded_channel::<String>();
+        let registry = crate::system_capability::new_registry();
+        let syscap_outbound = OutboundSender::new(syscap_tx);
+        let sys_cap = Some((registry, syscap_outbound));
+
+        let host_for_pump: Arc<dyn AddinHost> = h.clone();
+        let outcome = run_tunnel_with_correlation(
+            inbound,
+            sink,
+            &mut outbound_rx,
+            host_for_pump,
+            cancel,
+            None,
+            sys_cap,
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Closed);
+
+        // external_event НЕ должен был получить addin.spawn.
+        assert!(
+            h.events().is_empty(),
+            "addin.spawn must NOT reach external_event, got: {:?}",
+            h.events()
+        );
+
+        // В syscap_rx должен прийти JSON-RPC ответ с result.pid.
+        let resp_str = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            syscap_rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for addin.spawn response")
+        .expect("channel closed");
+        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        assert!(
+            resp["result"]["pid"].as_u64().unwrap_or(0) > 0,
+            "expected pid in result, got: {resp}"
+        );
+    }
+
+    /// Обычный JSON-RPC (не addin.*) по-прежнему уходит в `external_event`.
+    #[tokio::test]
+    async fn non_addin_payload_still_goes_to_external_event() {
+        let h = host();
+        let regular_payload = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}"#;
+        let frames: Vec<Result<TextOrClose, Infallible>> = vec![
+            Ok(TextOrClose::Text(regular_payload.to_owned())),
+            Ok(TextOrClose::Close),
+        ];
+        let inbound = stream::iter(frames);
+        let (sink_tx, _sink_rx) = unbounded_channel::<String>();
+        let sink = VecSink(sink_tx);
+        let (_outbound_tx, mut outbound_rx) = unbounded_channel::<String>();
+        let cancel = CancellationToken::new();
+
+        // system_capability активно, но не должно перехватывать tools/call.
+        let (syscap_tx, _syscap_rx) = unbounded_channel::<String>();
+        let registry = crate::system_capability::new_registry();
+        let syscap_outbound = OutboundSender::new(syscap_tx);
+        let sys_cap = Some((registry, syscap_outbound));
+
+        let host_for_pump: Arc<dyn AddinHost> = h.clone();
+        let outcome = run_tunnel_with_correlation(
+            inbound,
+            sink,
+            &mut outbound_rx,
+            host_for_pump,
+            cancel,
+            None,
+            sys_cap,
+        )
+        .await;
+        assert_eq!(outcome, RunOutcome::Closed);
+
+        // external_event ДОЛЖЕН получить этот payload.
+        let evs = h.events();
+        assert_eq!(evs.len(), 1, "expected 1 external_event, got: {:?}", evs);
+        assert_eq!(evs[0].0, EVENT_INCOMING);
+        assert_eq!(evs[0].1, regular_payload);
     }
 }
