@@ -167,16 +167,24 @@ pub fn resolve(input: &ResolveInput, host_info: &dyn HostInfoProvider) -> Sessio
     let pairs = parse_startup_param(&input.startup_param);
     let kind_override = pairs.get("kind").map(String::as_str);
     let correlation_id = pairs.get("correlation_id").cloned();
+    let uid_override = pairs.get("client_uid").map(String::as_str);
 
     let kind = match kind_override {
         Some(k) if !k.is_empty() => k.to_owned(),
         _ => infer_kind(&input.launch_string),
     };
 
-    let client_uid = if input.client_uid.is_empty() {
-        fresh_client_uid()
-    } else {
-        input.client_uid.clone()
+    // ADR-0030: manager-spawned клиенты получают expected client_uid через
+    // /C "client_uid=..." — этот override побеждает 1С-генерируемый UUID.
+    let client_uid = match uid_override {
+        Some(u) if !u.is_empty() => u.to_owned(),
+        _ => {
+            if input.client_uid.is_empty() {
+                fresh_client_uid()
+            } else {
+                input.client_uid.clone()
+            }
+        }
     };
 
     SessionParams {
