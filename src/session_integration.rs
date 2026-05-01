@@ -165,25 +165,32 @@ impl Connector for WsConnector {
     fn connect(&self) -> Self::ConnectFut {
         let url = self.url.clone();
         Box::pin(async move {
-            // Защита от зависания HTTP/upgrade (tokio_tungstenite на некоторых
-            // транспортах вроде Docker Desktop vpnkit может не дочитать ответ
-            // 101 и висеть в `connect_async` бесконечно). 5 секунд ≫ обычного
-            // RTT и времени upgrade'а; превышение — явный сигнал к ретраю.
+            tracing::info!(url = %url, "WsConnector: calling connect_async");
             let connect_fut = connect_async(&url);
-            let (ws, _resp) = match tokio::time::timeout(
+            let (ws, resp) = match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 connect_fut,
             )
             .await
             {
-                Ok(res) => res?,
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    tracing::error!(url = %url, error = ?e, "WsConnector: connect_async failed");
+                    return Err(e);
+                }
                 Err(_) => {
+                    tracing::error!(url = %url, "WsConnector: connect_async timed out (5s)");
                     return Err(WsError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "connect_async timed out (5s)",
                     )));
                 }
             };
+            tracing::info!(
+                url = %url,
+                status = %resp.status(),
+                "WsConnector: WS upgrade succeeded"
+            );
             let (sink, stream) = ws.split();
             Ok((WsStreamAdapter { inner: stream }, WsSinkAdapter { inner: sink }))
         })

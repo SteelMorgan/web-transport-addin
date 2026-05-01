@@ -89,6 +89,12 @@ impl SessionAddIn {
         let cid = correlation_id.get_string()?;
         let cid_opt = if cid.is_empty() { None } else { Some(cid) };
 
+        tracing::info!(
+            url = %url_str,
+            correlation_id = ?cid_opt,
+            "session.start: spawning SessionIntegration"
+        );
+
         let policy = BackoffPolicy {
             initial: Duration::from_millis(500),
             max: Duration::from_secs(30),
@@ -110,6 +116,7 @@ impl SessionAddIn {
 
     fn send(&mut self, text: &mut Variant, return_value: &mut Variant) -> AddinResult {
         let msg = text.get_string()?;
+        tracing::debug!(len = msg.len(), preview = %preview(&msg, 200), "session.send");
         let integration = self
             .integration
             .as_ref()
@@ -122,6 +129,7 @@ impl SessionAddIn {
     }
 
     fn stop(&mut self, return_value: &mut Variant) -> AddinResult {
+        tracing::info!("session.stop: shutting down integration");
         if let Some(integration) = self.integration.take() {
             let _ = integration.shutdown();
         }
@@ -188,6 +196,15 @@ impl SimpleAddin for SessionAddIn {
             getter: Some(Self::last_error),
             setter: None,
         }]
+    }
+}
+
+fn preview(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_owned()
+    } else {
+        let head: String = s.chars().take(n).collect();
+        format!("{head}…")
     }
 }
 

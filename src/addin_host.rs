@@ -152,12 +152,24 @@ impl RealAddinHost {
 
 impl AddinHost for RealAddinHost {
     fn external_event(&self, event: &str, payload: &str) -> bool {
-        let (_waited, ok) = self.pacer.run(&ThreadSleeper, || {
+        let preview: String = if payload.chars().count() <= 200 {
+            payload.to_owned()
+        } else {
+            payload.chars().take(200).collect::<String>() + "…"
+        };
+        let (waited, ok) = self.pacer.run(&ThreadSleeper, || {
             let event_c = CString1C::from(event);
             let payload_c = CString1C::from(payload);
             self.connection
                 .external_event(name!("WebTransport"), event_c, payload_c)
         });
+        tracing::debug!(
+            event = %event,
+            ok,
+            waited_ms = waited.as_millis() as u64,
+            payload = %preview,
+            "RealAddinHost.external_event"
+        );
         ok
     }
 }

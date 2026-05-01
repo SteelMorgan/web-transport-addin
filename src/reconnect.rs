@@ -107,15 +107,19 @@ impl StateEmitter {
     }
 
     fn connecting(&self, attempt: u32) {
+        tracing::info!(attempt, "state -> connecting");
         self.emit(format!("{{\"state\":\"connecting\",\"attempt\":{attempt}}}"));
     }
     fn connected(&self) {
+        tracing::info!("state -> connected");
         self.emit("{\"state\":\"connected\"}".to_owned());
     }
     fn disconnected(&self, reason: &str) {
+        tracing::warn!(reason, "state -> disconnected");
         self.emit(format!("{{\"state\":\"disconnected\",\"reason\":\"{reason}\"}}"));
     }
     fn give_up(&self, reason: &str) {
+        tracing::error!(reason, "state -> give_up");
         self.emit(format!("{{\"state\":\"give_up\",\"reason\":\"{reason}\"}}"));
     }
 }
