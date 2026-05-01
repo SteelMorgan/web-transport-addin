@@ -357,7 +357,7 @@ async fn do_kill(pid: u32, force: bool) -> Result<(), String> {
 
         let handle =
             unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             return Err(format!("OpenProcess failed for pid {}", pid));
         }
         let ok = unsafe { TerminateProcess(handle, 1) };
