@@ -82,3 +82,34 @@ BSL-сторона (`Мсп_ТранспортСессионКлиент.Module.
 
 - **WS-handshake + auto-reconnect + WS-уровневый ping/pong** → Rust addin (этот репозиторий).
 - **Application-level JSON-RPC ping и session.register** → BSL (`SteelMorgan/onec-client-mcp-devkit`).
+
+## Технический долг и план рефакторинга
+
+По итогам архитектурного ревью (диалог 2026-05-04) выявлены нарушения принципа «transport-only» в текущей реализации форка. Полный анализ — в [ADR-0005: Transport-only Rust](docs/decisions/0005-transport-only-rust.md). Парный ADR на стороне прикладного расширения — `onec-client-mcp-devkit/docs/decisions/0003-spawn-tools-in-test-client.md`.
+
+### Зафиксированные нарушения
+
+| # | Нарушение | Где | Серьёзность | План |
+|---|-----------|-----|-------------|------|
+| 1 | `kind`-эвристика по `СтрокаЗапуска()` (TESTMANAGER → vanessa_manager и т.п.) — прикладной домен в transport-слое | `src/session_params.rs` | средняя — расширяемость | Перенести эвристику в BSL `Мсп_ПараметрыЗапускаКлиент`. В Rust оставить чтение `/C kind=...` без интроспекции. ~45 строк правок. |
+| 2 | `addin.spawn` / `addin.kill` JSON-RPC handlers + process supervisor — application capability в transport-компоненте | `src/system_capability.rs`, `src/tunnel.rs::try_dispatch_addin_method` | высокая — концепция | Удалить целиком (~850 строк). Перенести в прикладное расширение `exts/test_client/` репозитория `onec-client-mcp-devkit` как обычные MCP-tools. См. ADR-0005 и парный ADR-0003. |
+| 3 | JSON-конверт `correlation_id` в incoming-payload | `src/tunnel.rs::dispatch_incoming_correlated` | низкая | Оставить как есть — необходимый инфраструктурный механизм трассировки реконнектов. |
+
+### Этапы перехода
+
+Поэтапно, синхронизированно с `onec-client-mcp-devkit` и `v8-client-session-manager`:
+
+1. **Этап А (`onec-client-mcp-devkit`):** реализовать `system_spawn_1c_client` / `system_kill_pid` как MCP-tools в `exts/test_client/`. Allow-list + regex-валидация. Старые `addin.spawn` в Rust остаются для обратной совместимости.
+2. **Этап Б (`v8-client-session-manager`):** менеджер переключается с `addin.spawn` / `addin.kill` на новые MCP-tools. Жизненный цикл клиента отслеживается heartbeat'ом (timeout на `ping`).
+3. **Этап В (этот репозиторий):**
+   - Перенести `kind`-эвристику в BSL (нарушение 1) — независимая правка, можно делать раньше.
+   - После завершения этапа Б удалить `system_capability.rs`, `try_dispatch_addin_method`, supervisor registry. Зависимости `nix`, части `windows-sys` уйдут.
+   - ADR-0027 переводится в `superseded`.
+   - ADR-0029 (host_id/pid/capabilities) частично остаётся в силе: `host_id`/`pid` сохраняются в Rust, `capabilities` переходят на сторону BSL.
+
+### Что **не** меняется
+
+- Транспорт (`tunnel`, `reconnect`, `session_integration`) — без изменений.
+- FFI-класс `session` (`session/addin.rs`) — без изменений.
+- ADR-0004 (mock-strategy) — остаётся в силе.
+- correlation_id-конверт (нарушение 3 признано допустимым).
