@@ -4,7 +4,6 @@ mod session_params;
 mod tunnel;
 mod reconnect;
 mod session_integration;
-pub mod system_capability;
 #[cfg(test)]
 mod harness_tests;
 mod http;

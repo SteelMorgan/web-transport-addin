@@ -1,8 +1,8 @@
 # ADR-0005: Transport-only Rust — убираем addin.spawn/kill и process supervisor
 
-- Статус: proposed
-- Дата: 2026-05-04
-- Связанные ADR: [ADR-0027 (надстройка)](#) — будет переведена в `superseded`. ADR-0029 (host_id/pid/capabilities) сохраняет силу частично.
+- Статус: accepted
+- Дата: 2026-05-04 (proposed) → 2026-05-05 (accepted после реализации этапов А/Б/В).
+- Связанные ADR: ADR-0027 переведён в `superseded`. ADR-0029 (host_id/pid) сохраняет силу частично — поле `capabilities` упразднено, host_id/pid остаются.
 - Связанные документы: [`FORK_CHANGES.md`](../../FORK_CHANGES.md), парный ADR `onec-client-mcp-devkit/docs/decisions/0003-spawn-tools-in-test-client.md`.
 
 ## Контекст
@@ -51,14 +51,14 @@
 | `src/session/addin.rs` | FFI-класс `session` (start/send/stop/getParams) |
 | `src/harness_tests.rs` | интеграционные тесты transport'а |
 
-### Capabilities
+### Capabilities — отдельный механизм отменяется
 
-Поле `SessionParams.capabilities` переходит в **информационное** состояние: транспорт не объявляет capabilities самостоятельно. Список заполняется на стороне BSL (расширение `client-mcp` собирает capabilities из загруженных прикладных расширений). Если `exts/test_client/` загружен и в нём зарегистрированы spawn/kill tools — capabilities присутствуют. Если расширение не загружено — capabilities пустые.
+Изначально предполагалось, что Rust перестанет жёстко зашивать `["spawn","kill"]`, а BSL будет передавать capabilities через FFI. После повторного анализа выяснилось, что **отдельное поле `capabilities` вообще избыточно**: в `session.register.params.tools` уже идёт массив зарегистрированных в BSL инструментов с их именами. Менеджер использует capabilities ровно в одном месте — `registry::find_spawner(host_id, "spawn")` (`v8-client-session-manager/src/session_manager/registry.rs:323`), — и эта функция тривиально заменяется на поиск сессии, в чьём каталоге tools присутствует имя `system_spawn_1c_client`.
 
-Для Rust это означает:
-- `SessionParams.capabilities: Vec<String>` остаётся как поле, но Rust **не задаёт его значение по умолчанию**.
-- BSL передаёт capabilities в FFI-метод `start`/`getParams` (или через отдельный setter).
-- Совместимость: если BSL ничего не передал — пустой массив (старый `vec!["spawn","kill"]` исчезает).
+Решение для Rust:
+- На этапе В удаляется как `vec!["spawn","kill"]` по умолчанию, так и само поле `SessionParams.capabilities` (вместе с сериализацией в `session.register`).
+- BSL **ничего не передаёт** — capabilities как отдельной сущности не существует.
+- Маршрутизация на стороне менеджера переключается на поиск по имени tool (см. парный ADR в onec-client-mcp-devkit).
 
 ### child_exited
 
@@ -98,6 +98,6 @@
 ## Ссылки
 
 - ADR-0027 (system capability layer) — будет `superseded` по завершении этапа В.
-- ADR-0029 (host_id/pid/capabilities в session.register) — частично сохраняет силу: host_id и pid остаются в Rust, capabilities переходят на BSL.
+- ADR-0029 (host_id/pid/capabilities в session.register) — частично сохраняет силу: host_id и pid остаются в Rust; поле `capabilities` упраздняется как отдельный механизм (маршрутизация переходит на имена tools в `params.tools`).
 - Парный ADR `onec-client-mcp-devkit/docs/decisions/0003-spawn-tools-in-test-client.md`.
 - Дискуссия по архитектуре, диалог 2026-05-04.

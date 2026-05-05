@@ -35,7 +35,6 @@ use crate::addin_host::AddinHost;
 use crate::reconnect::{
     run_with_reconnect_correlated, BackoffPolicy, Connector, FinalOutcome,
 };
-use crate::system_capability::new_registry;
 use crate::tunnel::{OutboundSender, SendError, TextOrClose};
 
 /// Handle, который владеет фоновой задачей tunnel/reconnect.
@@ -77,11 +76,9 @@ impl SessionIntegration {
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
 
-        // Создать supervisor registry один раз на интеграцию (per-integration,
-        // не global). Registry — Arc, переживает reconnect; дочерние процессы
-        // не теряются при разрыве WS-соединения.
-        let registry = new_registry();
-        let sys_cap = Some((registry, OutboundSender::new(outbound_tx.clone())));
+        // ADR-0005 / ADR-0003: spawn-supervisor (system_capability registry)
+        // удалён — spawn/kill живут в test_client tools и не требуют поддержки
+        // в транспорте.
 
         let task = runtime.spawn(async move {
             run_with_reconnect_correlated(
@@ -91,7 +88,6 @@ impl SessionIntegration {
                 cancel_for_task,
                 policy,
                 correlation_id,
-                sys_cap,
             )
             .await
         });

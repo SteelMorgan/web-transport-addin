@@ -31,8 +31,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::addin_host::AddinHost;
-use crate::tunnel::{run_tunnel_with_correlation, OutboundSender, RunOutcome, TextOrClose};
-use crate::system_capability::Registry;
+use crate::tunnel::{run_tunnel_with_correlation, RunOutcome, TextOrClose};
 
 /// Имя внешнего события 1С для смены состояния канала.
 pub const EVENT_RECONNECT_STATE: &str = "WS_RECONNECT_STATE";
@@ -135,17 +134,15 @@ pub async fn run_with_reconnect<C>(
 where
     C: Connector,
 {
-    run_with_reconnect_correlated(connector, host, outbound, cancel, policy, None, None).await
+    run_with_reconnect_correlated(connector, host, outbound, cancel, policy, None).await
 }
 
 /// Вариант [`run_with_reconnect`] с `correlation_id`, который пробрасывается
-/// в каждое входящее событие через [`tunnel::dispatch_incoming_correlated`],
-/// и опциональным `system_capability` для роутинга `addin.*`-методов.
+/// в каждое входящее событие через [`tunnel::dispatch_incoming_correlated`].
 ///
-/// `system_capability` — `Option<(Registry, OutboundSender)>`:
-/// - `None` — все входящие идут в `external_event` (обратная совместимость).
-/// - `Some(...)` — на каждом reconnect-итерации пара клонируется и передаётся
-///   в `run_tunnel_with_correlation`, registry переживает reconnect.
+/// ADR-0005 / ADR-0003: addin — только транспорт, поэтому `system_capability`
+/// больше не нужен. Spawn/kill живут в test_client tools и идут обычными
+/// `tools/call`-фреймами через `external_event`.
 pub async fn run_with_reconnect_correlated<C>(
     connector: C,
     host: Arc<dyn AddinHost>,
@@ -153,7 +150,6 @@ pub async fn run_with_reconnect_correlated<C>(
     cancel: CancellationToken,
     policy: BackoffPolicy,
     correlation_id: Option<String>,
-    system_capability: Option<(Registry, OutboundSender)>,
 ) -> FinalOutcome
 where
     C: Connector,
@@ -186,12 +182,6 @@ where
                 emitter.connected();
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-                // Клонируем sys_cap для этой итерации tunnel'а; registry — Arc,
-                // поэтому переживает reconnect и сохраняет дочерние процессы.
-                let sys_cap_for_tunnel = system_capability
-                    .as_ref()
-                    .map(|(r, o)| (r.clone(), o.clone()));
-
                 let outcome = run_tunnel_with_correlation(
                     inbound,
                     sink,
@@ -199,7 +189,6 @@ where
                     host.clone(),
                     cancel.clone(),
                     correlation_id.as_deref(),
-                    sys_cap_for_tunnel,
                 )
                 .await;
 

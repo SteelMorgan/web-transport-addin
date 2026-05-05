@@ -7,16 +7,19 @@
 //!   значение `manager_url=...` в `/C` ИГНОРИРУЕТСЯ (явно вне контракта).
 //! - `client_uid` — генерируется на стороне 1С через `Новый УникальныйИдентификатор()`;
 //!   для удобства тестов и harness'а здесь же есть [`fresh_client_uid`].
-//! - `kind` — берётся из `/C"kind=..."`, если задан, иначе вычисляется по
-//!   `СтрокаЗапуска()` (LaunchString) по эвристике: `/TESTMANAGER` →
-//!   `vanessa_manager`, `/TESTCLIENT` → `vanessa_test_client`,
-//!   `RunYaXUnit` → `yaxunit_runner`, иначе → `client`.
+//! - `kind` — берётся из `/C"kind=..."`. По умолчанию `"client"`. Эвристика
+//!   по `СтрокаЗапуска()` удалена (ADR-0005, нарушение №1): теперь явный
+//!   `kind=...` обязан передаваться менеджером (LocalBackend инжектит его
+//!   в /C через kind_hint), либо BSL-стороной. Никаких догадок по флагам
+//!   `/TESTMANAGER` / `/TESTCLIENT` / `RunYaXUnit` в Rust больше нет.
 //! - `correlation_id` — напрямую из `/C"correlation_id=..."`; если нет —
 //!   `None`.
 //! - `host_id` — приоритет: env `V8_HOST_ID` → `gethostname` → `"unknown"`.
 //!   ADR-0029.
 //! - `pid` — `std::process::id()`. ADR-0029.
-//! - `capabilities` — `["spawn", "kill"]`. ADR-0029.
+//! - `capabilities` — поле удалено (ADR-0003 / ADR-0005). Spawn/kill живут
+//!   как обычные tools в test_client; маршрутизация менеджера идёт по имени
+//!   tool в `session.register.tools`.
 //!
 //! Парсер `ПараметрЗапуска` (`StartupParameter`) умышленно живёт здесь, в
 //! Rust, а не в БСП‑обёртке: это снимает завязку реализации на конкретный
@@ -43,9 +46,6 @@ pub const HOST_ID_ENV: &str = "V8_HOST_ID";
 /// Известные значения `kind`, которые менеджер ожидает в `session.register`.
 pub mod kinds {
     pub const CLIENT: &str = "client";
-    pub const VANESSA_MANAGER: &str = "vanessa_manager";
-    pub const VANESSA_TEST_CLIENT: &str = "vanessa_test_client";
-    pub const YAXUNIT_RUNNER: &str = "yaxunit_runner";
 }
 
 // ─── HostInfoProvider trait ────────────────────────────────────────────────
@@ -136,8 +136,6 @@ pub struct SessionParams {
     pub host_id: String,
     /// PID процесса 1cv8c, в который загружен addin (ADR-0029).
     pub pid: u32,
-    /// Capabilities, поддерживаемые этим экземпляром addin (ADR-0029).
-    pub capabilities: Vec<String>,
 }
 
 impl SessionParams {
@@ -171,7 +169,7 @@ pub fn resolve(input: &ResolveInput, host_info: &dyn HostInfoProvider) -> Sessio
 
     let kind = match kind_override {
         Some(k) if !k.is_empty() => k.to_owned(),
-        _ => infer_kind(&input.launch_string),
+        _ => kinds::CLIENT.to_owned(),
     };
 
     // ADR-0030: manager-spawned клиенты получают expected client_uid через
@@ -194,7 +192,6 @@ pub fn resolve(input: &ResolveInput, host_info: &dyn HostInfoProvider) -> Sessio
         correlation_id,
         host_id: host_info.host_id(),
         pid: host_info.pid(),
-        capabilities: vec!["spawn".into(), "kill".into()],
     }
 }
 
@@ -215,20 +212,6 @@ pub fn parse_startup_param(raw: &str) -> HashMap<String, String> {
         }
     }
     out
-}
-
-/// Эвристика определения `kind` по `СтрокаЗапуска()`. Регистр не учитывается.
-pub fn infer_kind(launch_string: &str) -> String {
-    let upper = launch_string.to_ascii_uppercase();
-    if upper.contains("/TESTMANAGER") {
-        kinds::VANESSA_MANAGER.to_owned()
-    } else if upper.contains("/TESTCLIENT") {
-        kinds::VANESSA_TEST_CLIENT.to_owned()
-    } else if upper.contains("RUNYAXUNIT") {
-        kinds::YAXUNIT_RUNNER.to_owned()
-    } else {
-        kinds::CLIENT.to_owned()
-    }
 }
 
 #[cfg(test)]
@@ -281,37 +264,15 @@ mod tests {
     }
 
     #[test]
-    fn kind_inferred_from_testmanager_flag() {
+    fn kind_defaults_to_client_without_override() {
+        // ADR-0005: эвристика по СтрокаЗапуска удалена. Без явного /C"kind=..."
+        // kind становится "client" независимо от флагов в launch_string.
         let p = resolve_t(&input("", "DESIGNER /TESTMANAGER", "", "uid-1"));
-        assert_eq!(p.kind, kinds::VANESSA_MANAGER);
-    }
-
-    #[test]
-    fn kind_inferred_from_testclient_flag_case_insensitive() {
-        let p = resolve_t(&input("", "1cv8c /testclient -port=12345", "", "uid-1"));
-        assert_eq!(p.kind, kinds::VANESSA_TEST_CLIENT);
-    }
-
-    #[test]
-    fn kind_inferred_from_runyaxunit_in_command_line() {
-        let p = resolve_t(&input(
-            "",
-            "1cv8c ENTERPRISE /Sserver /CRunYaXUnit",
-            "",
-            "uid-1",
-        ));
-        assert_eq!(p.kind, kinds::YAXUNIT_RUNNER);
-    }
-
-    #[test]
-    fn kind_defaults_to_client() {
-        let p = resolve_t(&input("", "1cv8c ENTERPRISE", "", "uid-1"));
         assert_eq!(p.kind, kinds::CLIENT);
     }
 
     #[test]
-    fn kind_override_from_startup_param_beats_heuristic() {
-        // /TESTMANAGER в launch, но override через /C"kind=..." должен победить.
+    fn kind_override_from_startup_param_wins() {
         let p = resolve_t(&input(
             "",
             "DESIGNER /TESTMANAGER",
@@ -322,9 +283,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_kind_override_keeps_heuristic() {
+    fn empty_kind_override_falls_back_to_client() {
         let p = resolve_t(&input("", "DESIGNER /TESTMANAGER", "kind=", "uid-1"));
-        assert_eq!(p.kind, kinds::VANESSA_MANAGER);
+        assert_eq!(p.kind, kinds::CLIENT);
     }
 
     #[test]
@@ -395,7 +356,6 @@ mod tests {
             correlation_id: None,
             host_id: "test-host".into(),
             pid: 12345,
-            capabilities: vec!["spawn".into(), "kill".into()],
         };
         let json = p.to_json();
         assert!(!json.contains("correlation_id"));
@@ -412,7 +372,6 @@ mod tests {
             correlation_id: Some("trace-9".to_owned()),
             host_id: "test-host".into(),
             pid: 12345,
-            capabilities: vec!["spawn".into(), "kill".into()],
         };
         let json = p.to_json();
         assert!(json.contains("\"correlation_id\":\"trace-9\""));
@@ -448,10 +407,12 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_serialized_as_string_array() {
+    fn capabilities_field_no_longer_serialised() {
+        // ADR-0003 / ADR-0005: spawn/kill — это tools в test_client.
+        // Поле capabilities удалено из SessionParams целиком.
         let p = resolve_t(&input("", "", "", "uid-1"));
         let json = p.to_json();
-        assert!(json.contains("\"capabilities\":[\"spawn\",\"kill\"]"));
+        assert!(!json.contains("capabilities"));
     }
 
     #[test]
