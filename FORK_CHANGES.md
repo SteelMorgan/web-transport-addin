@@ -62,19 +62,21 @@ Manager-spawned клиенты получают expected `client_uid` через
 
 ### Пинги
 
-Два независимых уровня:
+Два независимых уровня — каждый ловит свой класс зависаний.
 
 **WebSocket protocol-level ping/pong (RFC 6455):**
-- Где: `tokio_tungstenite` обрабатывает их сам внутри `WebSocketStream`.
-- Кто инициирует: session-manager (отправляет `Ping` фреймы клиенту по таймеру).
-- Кто отвечает: Rust addin → автоматический `Pong` через tokio-tungstenite, в BSL не пробрасывается. См. `session_integration.rs:202-227` (бинарные/ping/pong/frame игнорируются).
-- Зачем: keep-alive TCP-соединения, обнаружение разрыва без потери данных.
+- Где: `tokio_tungstenite` обрабатывает входящие WS-Ping автоматически. См. `session_integration.rs:202-227` — бинарные/ping/pong/frame фреймы игнорируются на уровне обёртки (Pong отвечает tungstenite).
+- Кто инициирует: **никто на стороне приложения**. Ни менеджер, ни addin сами WS-Ping не генерируют. Если их шлёт ОС/прокси/мост — tungstenite ответит автоматически.
+- Что детектит: разрыв TCP, NAT-timeout, dead peer на уровне сетевого стека.
+- Что НЕ детектит: зависание event-loop приложения — tokio worker отвечает Pong даже если BSL-обработчик заблокирован.
 
 **Application-level JSON-RPC ping:**
 - Где (приём): `onec-client-mcp-devkit/.../Мсп_ТранспортСессионКлиент.Module.bsl:259-262` — обработчик `method = "ping"` отвечает пустым `result`.
-- Кто инициирует: session-manager шлёт `{"jsonrpc":"2.0","method":"ping","id":N}`, клиент возвращает пустой `result`.
-- Кто отвечает: BSL-расширение (1С), не Rust.
-- Зачем: liveness-check на уровне приложения — проверка, что 1С-клиент не завис в обработчике (TCP keep-alive это не покажет).
+- Кто инициирует: **session-manager** шлёт `{"jsonrpc":"2.0","method":"ping","id":N}` — раз в `mcp.session_manager.app_ping_interval_ms` (default 20000 мс), таймаут ответа `app_ping_timeout_ms` (default 5000 мс). Реализация: `v8-session-manager/src/session_manager/ping.rs`. `app_ping_interval_ms = 0` → пинг отключён.
+- Кто отвечает: BSL-расширение (1С), не Rust. Ответ возвращается через тот же FFI/WS-канал.
+- Что детектит: зависание event-loop 1С — модальный диалог, long-running BSL-операция, заблокированный `ОбработкаВнешнегоСобытия`. Если ответа нет за `app_ping_timeout_ms` или коннект уже мёртвый (`WriterClosed`), менеджер помечает сессию `Disconnected`. Generation-aware: на soft reconnect старая ping-task сама завершается по `Disconnected`, новая стартует на новом коннекте.
+
+> **TL;DR.** WS-Ping проверяет, жив ли TCP-стек. Application-level ping проверяет, жив ли event loop 1С. Транспорту нужен второй, потому что первый может «врать»: tokio worker отвечает за зависшую BSL.
 
 ### session.register после connect
 
