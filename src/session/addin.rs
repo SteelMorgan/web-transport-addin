@@ -77,8 +77,19 @@ impl SessionAddIn {
         // формирует session.register после `WS_RECONNECT_STATE=connected`
         // (см. ADR‑0020). Параметры приняты в API, чтобы зафиксировать
         // контракт и пригодились на этапе 7 (correlation в нотификациях).
-        if self.integration.is_some() {
-            return Err("Сессионная интеграция уже запущена".to_owned().into());
+        // #97: идемпотентность повторного `Запустить`. Если предыдущая интеграция
+        // ещё жива (BSL не вызвал stop, либо вызвал слишком быстро), сначала
+        // корректно завершаем её — cancel-токен + abort task, чтобы новый
+        // connect стартовал на чистом состоянии, а не «поверх» зомби-task.
+        if let Some(prev) = self.integration.take() {
+            tracing::warn!("session.start: previous integration still alive, shutting it down");
+            // Round-2 fix: drop вместо shutdown(). shutdown() вызывает .take()
+            // у task, и возвращаемый JoinHandle сразу дропается — а Drop для
+            // tokio::JoinHandle = detach, не abort. Это означало, что наш
+            // impl Drop для SessionIntegration (с cancel.cancel() + abort())
+            // не срабатывал, потому что task уже был None. drop(prev) запускает
+            // полноценный Drop с отменой и abort.
+            drop(prev);
         }
         let connection = self
             .connection
@@ -131,7 +142,10 @@ impl SessionAddIn {
     fn stop(&mut self, return_value: &mut Variant) -> AddinResult {
         tracing::info!("session.stop: shutting down integration");
         if let Some(integration) = self.integration.take() {
-            let _ = integration.shutdown();
+            // Round-2 fix (W-1): унифицированный путь остановки через Drop,
+            // см. комментарий в start(). shutdown()-путь оставлять нельзя —
+            // detach JoinHandle, abort не срабатывает.
+            drop(integration);
         }
         return_value.set_bool(true);
         Ok(())
@@ -139,6 +153,14 @@ impl SessionAddIn {
 
     fn version(&mut self, return_value: &mut Variant) -> AddinResult {
         return_value.set_str1c(VERSION.to_owned())?;
+        Ok(())
+    }
+
+    fn set_log_level(&mut self, level: &mut Variant, return_value: &mut Variant) -> AddinResult {
+        let level_str = level.get_string()?;
+        let ok = crate::set_log_level(&level_str);
+        tracing::info!(level = %level_str, ok, "session.НастроитьЛогирование");
+        return_value.set_bool(ok);
         Ok(())
     }
 
@@ -187,6 +209,10 @@ impl SimpleAddin for SessionAddIn {
             MethodInfo {
                 name: name!("Версия"),
                 method: Methods::Method0(Self::version),
+            },
+            MethodInfo {
+                name: name!("НастроитьЛогирование"),
+                method: Methods::Method1(Self::set_log_level),
             },
         ]
     }

@@ -41,7 +41,7 @@ use crate::tunnel::{OutboundSender, SendError, TextOrClose};
 pub struct SessionIntegration {
     cancel: CancellationToken,
     outbound: OutboundSender,
-    task: JoinHandle<FinalOutcome>,
+    task: Option<JoinHandle<FinalOutcome>>,
 }
 
 impl SessionIntegration {
@@ -94,7 +94,7 @@ impl SessionIntegration {
         Self {
             cancel,
             outbound: OutboundSender::new(outbound_tx),
-            task,
+            task: Some(task),
         }
     }
 
@@ -132,9 +132,28 @@ impl SessionIntegration {
     }
 
     /// Сигнализировать остановку. Вызов consume'ит handle.
-    pub fn shutdown(self) -> JoinHandle<FinalOutcome> {
+    pub fn shutdown(mut self) -> JoinHandle<FinalOutcome> {
+        tracing::info!("SessionIntegration::shutdown — cancelling token and returning task handle");
         self.cancel.cancel();
+        // Take the JoinHandle so Drop импл ничего не abort'ит дополнительно.
         self.task
+            .take()
+            .expect("SessionIntegration::task already taken")
+    }
+}
+
+// #97: гарантировать abort фоновой reconnect/tunnel task при дропе integration.
+// Без этого при close DRIVE (когда BSL не вызвал session.stop) старая task
+// остаётся жить в runtime, и дроп runtime блокируется до её завершения.
+// Если task висит в `connect_async` (наблюдалось на Windows при быстром
+// re-open DRIVE), runtime drop тормозит дроп всего addin'а.
+impl Drop for SessionIntegration {
+    fn drop(&mut self) {
+        if let Some(handle) = self.task.take() {
+            tracing::info!("SessionIntegration::drop — cancelling token and aborting task");
+            self.cancel.cancel();
+            handle.abort();
+        }
     }
 }
 
@@ -161,7 +180,12 @@ impl Connector for WsConnector {
     fn connect(&self) -> Self::ConnectFut {
         let url = self.url.clone();
         Box::pin(async move {
-            tracing::info!(url = %url, "WsConnector: calling connect_async");
+            // #97: diagnostic-first — каждая фаза WS-handshake'а должна оставлять
+            // явный след в tracing-логе. Без этого баг «TCP ESTAB, Upgrade не ушёл»
+            // невидим в самих логах addin'а (приходится ходить в `ss -tnp` на
+            // менеджере). См. tasks/97-ws-handshake-blocker/initial-notes.md.
+            let t0 = std::time::Instant::now();
+            tracing::info!(url = %url, phase = "upgrade_send_start", "WsConnector: calling connect_async");
             let connect_fut = connect_async(&url);
             let (ws, resp) = match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -171,11 +195,22 @@ impl Connector for WsConnector {
             {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(e)) => {
-                    tracing::error!(url = %url, error = ?e, "WsConnector: connect_async failed");
+                    tracing::error!(
+                        url = %url,
+                        phase = "upgrade_failed",
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        error = ?e,
+                        "WsConnector: connect_async failed"
+                    );
                     return Err(e);
                 }
                 Err(_) => {
-                    tracing::error!(url = %url, "WsConnector: connect_async timed out (5s)");
+                    tracing::error!(
+                        url = %url,
+                        phase = "upgrade_timeout",
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        "WsConnector: connect_async timed out (5s) — TCP up but no Upgrade response"
+                    );
                     return Err(WsError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "connect_async timed out (5s)",
@@ -184,7 +219,9 @@ impl Connector for WsConnector {
             };
             tracing::info!(
                 url = %url,
+                phase = "ws_open",
                 status = %resp.status(),
+                elapsed_ms = t0.elapsed().as_millis() as u64,
                 "WsConnector: WS upgrade succeeded"
             );
             let (sink, stream) = ws.split();

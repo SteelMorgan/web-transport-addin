@@ -150,6 +150,14 @@ impl RealAddinHost {
     }
 }
 
+/// Сколько раз мы ретраим `external_event`, если 1С отвергла доставку (вернула false).
+///
+/// Платформа возвращает false при «временно нельзя»: переполнение очереди событий,
+/// race при переинициализации компоненты и т.п. Ретрай через pacer-интервал
+/// (≥ EXTERNAL_EVENT_MIN_INTERVAL) даёт платформе время проглотить событие.
+/// 3 попытки = 1 первая + 2 ретрая = ≥ 300 мс на доставку.
+const EXTERNAL_EVENT_MAX_ATTEMPTS: u32 = 3;
+
 impl AddinHost for RealAddinHost {
     fn external_event(&self, event: &str, payload: &str) -> bool {
         let preview: String = if payload.chars().count() <= 200 {
@@ -157,20 +165,43 @@ impl AddinHost for RealAddinHost {
         } else {
             payload.chars().take(200).collect::<String>() + "…"
         };
-        let (waited, ok) = self.pacer.run(&ThreadSleeper, || {
-            let event_c = CString1C::from(event);
-            let payload_c = CString1C::from(payload);
-            self.connection
-                .external_event(name!("WebTransport"), event_c, payload_c)
-        });
-        tracing::debug!(
+        let mut total_waited = Duration::ZERO;
+        for attempt in 1..=EXTERNAL_EVENT_MAX_ATTEMPTS {
+            let (waited, ok) = self.pacer.run(&ThreadSleeper, || {
+                let event_c = CString1C::from(event);
+                let payload_c = CString1C::from(payload);
+                self.connection
+                    .external_event(name!("WebTransport"), event_c, payload_c)
+            });
+            total_waited += waited;
+            if ok {
+                tracing::debug!(
+                    event = %event,
+                    ok = true,
+                    attempt,
+                    waited_ms = total_waited.as_millis() as u64,
+                    payload = %preview,
+                    "RealAddinHost.external_event"
+                );
+                return true;
+            }
+            if attempt < EXTERNAL_EVENT_MAX_ATTEMPTS {
+                tracing::warn!(
+                    event = %event,
+                    attempt,
+                    "RealAddinHost.external_event: ok=false, retrying"
+                );
+            }
+        }
+        tracing::error!(
             event = %event,
-            ok,
-            waited_ms = waited.as_millis() as u64,
+            ok = false,
+            attempts = EXTERNAL_EVENT_MAX_ATTEMPTS,
+            waited_ms = total_waited.as_millis() as u64,
             payload = %preview,
-            "RealAddinHost.external_event"
+            "RealAddinHost.external_event: всё ещё ok=false после ретраев"
         );
-        ok
+        false
     }
 }
 

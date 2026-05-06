@@ -6,3 +6,4 @@ Cargo.lock
 .codex/*
 .continue.context/
 .context/
+BUILD_LOCAL.md

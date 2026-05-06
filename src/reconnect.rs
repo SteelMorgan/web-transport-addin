@@ -23,6 +23,7 @@
 //! для production будет адаптер поверх `tokio_tungstenite::connect_async`.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,13 +157,23 @@ where
 {
     let emitter = StateEmitter { host: host.clone() };
     let mut attempt: u32 = 0;
+    // #97: уникальный run_id для трассировки отдельной reconnect-task в
+    // tracing-логе — иначе при наличии «зомби» старой task их события в
+    // одном файле не различишь. Round-2 fix: монотонный счётчик вместо
+    // Instant::now().elapsed() (который у только что созданного Instant
+    // даёт ~единицы наносекунд → почти константа).
+    static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let run_id: u64 = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(run_id, "run_with_reconnect: started");
 
     loop {
         if cancel.is_cancelled() {
+            tracing::info!(run_id, attempt, "run_with_reconnect: cancelled at loop top");
             return FinalOutcome::Cancelled;
         }
 
         attempt = attempt.saturating_add(1);
+        tracing::info!(run_id, attempt, "reconnect_fired");
         emitter.connecting(attempt);
         // Async-yield после emit'а — на Linux 1С 8.3.27 платформа теряет
         // быстрые подряд external_event из background-потока tokio runtime,
@@ -222,9 +233,13 @@ where
         }
 
         let delay = policy.delay_for(attempt);
+        tracing::info!(run_id, attempt, delay_ms = delay.as_millis() as u64, "reconnect_scheduled");
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return FinalOutcome::Cancelled,
+            _ = cancel.cancelled() => {
+                tracing::info!(run_id, attempt, "run_with_reconnect: cancelled during backoff");
+                return FinalOutcome::Cancelled;
+            }
             _ = tokio::time::sleep(delay) => {}
         }
     }
