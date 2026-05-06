@@ -1,6 +1,8 @@
 # Доработки форка SteelMorgan/web-transport-addin
 
-> Документ описывает доработки относительно upstream-проекта `alkoleft/web-transport-addin`. Форк построен поверх upstream `main` на ревизии 0.6.4 и добавляет 12 коммитов, реализующих транспортный слой для интеграции с **v8-client-session-manager**. Версия компоненты поднята до **0.7.0** (`Manifest.xml`, `Cargo.toml`).
+> Документ описывает доработки относительно upstream-проекта `alkoleft/web-transport-addin`. Форк построен поверх upstream `main` на ревизии 0.6.4 и реализует транспортный слой для интеграции с **v8-session-manager**. Текущая версия компоненты — **0.7.2** (`Manifest.xml`, `Cargo.toml`).
+>
+> **Этапы А/Б/В рефакторинга «transport-only» завершены (ADR-0005 accepted, 2026-05-05).** Прикладные обязанности (process supervision, эвристика прикладного `kind` по флагам платформы) вынесены из транспорта в BSL и в расширение `test_client` соответствующего форка `onec-client-mcp-devkit`. Это историческая запись о доработках; раздел «Технический долг» закрыт.
 
 ## Назначение доработок
 
@@ -13,24 +15,24 @@ Upstream-компонента предоставляла три класса д�
 | Файл | Назначение |
 |------|-----------|
 | `src/addin_host.rs` | trait `AddinHost` + `RealAddinHost` (поверх `addin1c::ExternalEvent`) + `MockAddinHost` для тестов. Изоляция от FFI — позволяет гонять цепочку без живой 1С (ADR-0004). |
-| `src/session_params.rs` | Резолвер параметров сессии (`manager_url`, `kind`, `client_uid`, `correlation_id`) по контракту ADR-0020. Эвристика `kind` по `СтрокаЗапуска()`: TESTMANAGER → `vanessa_manager`, TESTCLIENT → `vanessa_test_client`, RunYaXUnit → `yaxunit_runner`, default → `client`. |
+| `src/session_params.rs` | Резолвер параметров сессии (`manager_url`, `kind`, `client_uid`, `correlation_id`) по контракту ADR-0020. `kind` приходит явным `/C "kind=..."`; если не передан — fallback `"client"`. *Эвристика `infer_kind` по флагам платформы (TESTMANAGER/TESTCLIENT/RunYaXUnit) удалена в этапе В как нарушение transport-only (ADR-0005); теперь это решает BSL.* |
 | `src/tunnel.rs` | Generic duplex WS-pump (`Stream<TextOrClose>` + `Sink<String>`). `RunOutcome { Cancelled / Closed / InboundError / OutboundDropped / SinkError }`. Переполнение очереди 1С НЕ разрывает соединение. |
 | `src/reconnect.rs` | Авто-reconnect с экспоненциальным backoff (`BackoffPolicy { initial, max, multiplier, max_attempts }`). Публикация состояний через `WS_RECONNECT_STATE` (`connecting` / `connected` / `disconnected` / `give_up`). |
 | `src/session_integration.rs` | Высокоуровневый фасад `start / send / shutdown` поверх `tokio_tungstenite`. `WsConnector` + адаптеры `WsStreamAdapter` / `WsSinkAdapter`. Сторона 1С сама шлёт `session.register` после `WS_RECONNECT_STATE=connected` (список tools знает только 1С). |
 | `src/session/addin.rs`, `src/session/mod.rs` | FFI-класс `session` для 1С: методы `start / send / stop / getParams`. |
-| `src/system_capability.rs` | JSON-RPC handlers `addin.spawn` / `addin.kill` поверх `tokio::process::Command` + `nix::signal` (Linux) / `windows-sys` (Windows). Supervisor registry `Arc<Mutex<HashMap<pid, ChildHandle>>>` переживает reconnect, шлёт `addin.child_exited` (ADR-0027). |
+| ~~`src/system_capability.rs`~~ | **Удалено в этапе В (ADR-0005).** Содержал JSON-RPC handlers `addin.spawn/addin.kill` и process supervisor поверх `tokio::process::Command` + `nix::signal` / `windows-sys`. Перенесено в `onec-client-mcp-devkit` → `exts/test_client/` как обычные MCP-tools `system_spawn_1c_client` / `system_kill_pid` (парный ADR-0003). ADR-0027 переведён в `superseded`. |
 | `src/harness_tests.rs` | End-to-end тесты против настоящего WS-сервера (`tokio_tungstenite::accept_async`): входящие фреймы → `WS_INCOMING`, исходящие через `send()`, `start_correlated`, give-up по `max_attempts`. |
 
 ## Расширение существующих модулей
 
 - `src/lib.rs` — регистрация класса `session`, инициализация `tracing` через `OnceLock` в `GetClassObject` (управляется `WEBTRANSPORT_LOG`, файл по умолчанию `/tmp/web-transport.log`).
 - `src/ws_client.rs`, `src/mcp/server.rs` — точечные правки совместимости.
-- `Cargo.toml` — добавлены `tokio-tungstenite`, `tracing`, `tracing-subscriber`, `nix` (Linux), `windows-sys` 0.59, `uuid` v4. Bump `windows-sys` потребовал фикса `system_capability.rs:360` (`handle == 0` → `handle.is_null()`).
+- `Cargo.toml` — добавлены `tokio-tungstenite`, `tracing`, `tracing-subscriber`, `uuid` v4. *После этапа В: зависимости `nix` и process-related часть `windows-sys` удалены вместе с `system_capability.rs`.*
 - `.cargo/config.toml` — настройки кросс-компиляции (5 целей: Win x32/x64 mingw, Linux x32/x64, macOS x64 zigbuild).
 
 ## Системные параметры сессии (ADR-0029)
 
-`SessionParams` расширен полями `host_id`, `pid`, `capabilities` через trait `HostInfoProvider` (`OsHostInfo`: `V8_HOST_ID` env → `gethostname()` → `"unknown"`). Capabilities `["spawn","kill"]` анонсируются в `session.register` — менеджер использует это для маршрутизации `session.spawn` через данный клиент.
+`SessionParams` несёт `host_id` и `pid` через trait `HostInfoProvider` (`OsHostInfo`: `V8_HOST_ID` env → `gethostname()` → `"unknown"`). *Поле `capabilities` (`["spawn","kill"]`) удалено в этапе В: маршрутизация на стороне менеджера идёт по имени MCP-tool, а не по флагу capability клиента (ADR-0005).*
 
 ## Override `client_uid` через `/C` (этап 6.6)
 
@@ -83,33 +85,27 @@ BSL-сторона (`Мсп_ТранспортСессионКлиент.Module.
 - **WS-handshake + auto-reconnect + WS-уровневый ping/pong** → Rust addin (этот репозиторий).
 - **Application-level JSON-RPC ping и session.register** → BSL (`SteelMorgan/onec-client-mcp-devkit`).
 
-## Технический долг и план рефакторинга
+## История: рефакторинг «transport-only» (этапы А/Б/В)
 
-По итогам архитектурного ревью (диалог 2026-05-04) выявлены нарушения принципа «transport-only» в текущей реализации форка. Полный анализ — в [ADR-0005: Transport-only Rust](docs/decisions/0005-transport-only-rust.md). Парный ADR на стороне прикладного расширения — `onec-client-mcp-devkit/docs/decisions/0003-spawn-tools-in-test-client.md`.
+По итогам архитектурного ревью 2026-05-04 в форке зафиксированы нарушения принципа «transport-only»: addin кроме транспорта брал на себя прикладные обязанности (process supervisor для `addin.spawn`/`addin.kill`, `kind`-эвристика по флагам `СтрокаЗапуска()`). Полный анализ — в [ADR-0005: Transport-only Rust](docs/decisions/0005-transport-only-rust.md). Парный ADR на стороне прикладного расширения — `onec-client-mcp-devkit/docs/decisions/0003-spawn-tools-in-test-client.md`. Все три этапа выполнены и приняты к 2026-05-05; раздел сохранён как историческая справка о форк-эволюции.
 
-### Зафиксированные нарушения
+### Что было исправлено
 
-| # | Нарушение | Где | Серьёзность | План |
-|---|-----------|-----|-------------|------|
-| 1 | `kind`-эвристика по `СтрокаЗапуска()` (TESTMANAGER → vanessa_manager и т.п.) — прикладной домен в transport-слое | `src/session_params.rs` | средняя — расширяемость | Перенести эвристику в BSL `Мсп_ПараметрыЗапускаКлиент`. В Rust оставить чтение `/C kind=...` без интроспекции. ~45 строк правок. |
-| 2 | `addin.spawn` / `addin.kill` JSON-RPC handlers + process supervisor — application capability в transport-компоненте | `src/system_capability.rs`, `src/tunnel.rs::try_dispatch_addin_method` | высокая — концепция | Удалить целиком (~850 строк). Перенести в прикладное расширение `exts/test_client/` репозитория `onec-client-mcp-devkit` как обычные MCP-tools. См. ADR-0005 и парный ADR-0003. |
-| 3 | JSON-конверт `correlation_id` в incoming-payload | `src/tunnel.rs::dispatch_incoming_correlated` | низкая | Оставить как есть — необходимый инфраструктурный механизм трассировки реконнектов. |
+| # | Нарушение | Где (исторически) | Что сделано |
+|---|-----------|-------------------|-------------|
+| 1 | `kind`-эвристика по `СтрокаЗапуска()` — прикладной домен в transport-слое | `src/session_params.rs::infer_kind` | Эвристика удалена. `kind` приходит явным `/C "kind=..."`; иначе fallback `"client"`. Прикладное определение — в BSL `Мсп_ПараметрыЗапускаКлиент`. |
+| 2 | `addin.spawn` / `addin.kill` JSON-RPC handlers + process supervisor — application capability в transport-компоненте | `src/system_capability.rs`, `src/tunnel.rs::try_dispatch_addin_method` | Удалены полностью (~840 строк + интеграционные тесты + диспатчер `addin.*` в `tunnel.rs`). Реализовано как MCP-tools `system_spawn_1c_client` / `system_kill_pid` в `onec-client-mcp-devkit/exts/test_client/`. Зависимости `nix`, process-related часть `windows-sys` удалены. |
+| 3 | JSON-конверт `correlation_id` в incoming-payload | `src/tunnel.rs::dispatch_incoming_correlated` | Оставлен — необходимый инфраструктурный механизм трассировки реконнектов. |
 
-### Этапы перехода
+### Хронология этапов
 
-Поэтапно, синхронизированно с `onec-client-mcp-devkit` и `v8-client-session-manager`:
+1. **Этап А (`onec-client-mcp-devkit`):** реализованы `system_spawn_1c_client` / `system_kill_pid` как MCP-tools в `exts/test_client/` (allow-list + regex-валидация). Старые `addin.spawn`/`addin.kill` в Rust сохранялись параллельно для обратной совместимости.
+2. **Этап Б (`v8-session-manager`):** менеджер переключён с `addin.spawn`/`addin.kill` на новые MCP-tools. Жизненный цикл клиента отслеживается heartbeat'ом (timeout на `ping`).
+3. **Этап В (этот репозиторий):** удалены `system_capability.rs`, `try_dispatch_addin_method`, supervisor registry, поле `capabilities` в `SessionParams`, эвристика `infer_kind`. ADR-0027 переведён в `superseded`. ADR-0029 (host_id/pid/capabilities) частично остаётся в силе: `host_id`/`pid` сохраняются в Rust, `capabilities` упразднены.
 
-1. **Этап А (`onec-client-mcp-devkit`):** реализовать `system_spawn_1c_client` / `system_kill_pid` как MCP-tools в `exts/test_client/`. Allow-list + regex-валидация. Старые `addin.spawn` в Rust остаются для обратной совместимости.
-2. **Этап Б (`v8-client-session-manager`):** менеджер переключается с `addin.spawn` / `addin.kill` на новые MCP-tools. Жизненный цикл клиента отслеживается heartbeat'ом (timeout на `ping`).
-3. **Этап В (этот репозиторий):**
-   - Перенести `kind`-эвристику в BSL (нарушение 1) — независимая правка, можно делать раньше.
-   - После завершения этапа Б удалить `system_capability.rs`, `try_dispatch_addin_method`, supervisor registry. Зависимости `nix`, части `windows-sys` уйдут.
-   - ADR-0027 переводится в `superseded`.
-   - ADR-0029 (host_id/pid/capabilities) частично остаётся в силе: `host_id`/`pid` сохраняются в Rust, `capabilities` переходят на сторону BSL.
+### Что **не** менялось
 
-### Что **не** меняется
-
-- Транспорт (`tunnel`, `reconnect`, `session_integration`) — без изменений.
-- FFI-класс `session` (`session/addin.rs`) — без изменений.
-- ADR-0004 (mock-strategy) — остаётся в силе.
-- correlation_id-конверт (нарушение 3 признано допустимым).
+- Транспорт (`tunnel`, `reconnect`, `session_integration`).
+- FFI-класс `session` (`session/addin.rs`).
+- ADR-0004 (mock-strategy).
+- correlation_id-конверт (нарушение 3 признано допустимым и сохранено).
