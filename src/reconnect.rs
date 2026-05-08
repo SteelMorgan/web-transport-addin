@@ -23,6 +23,7 @@
 //! для production будет адаптер поверх `tokio_tungstenite::connect_async`.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,15 +107,19 @@ impl StateEmitter {
     }
 
     fn connecting(&self, attempt: u32) {
+        tracing::info!(attempt, "state -> connecting");
         self.emit(format!("{{\"state\":\"connecting\",\"attempt\":{attempt}}}"));
     }
     fn connected(&self) {
+        tracing::info!("state -> connected");
         self.emit("{\"state\":\"connected\"}".to_owned());
     }
     fn disconnected(&self, reason: &str) {
+        tracing::warn!(reason, "state -> disconnected");
         self.emit(format!("{{\"state\":\"disconnected\",\"reason\":\"{reason}\"}}"));
     }
     fn give_up(&self, reason: &str) {
+        tracing::error!(reason, "state -> give_up");
         self.emit(format!("{{\"state\":\"give_up\",\"reason\":\"{reason}\"}}"));
     }
 }
@@ -135,6 +140,10 @@ where
 
 /// Вариант [`run_with_reconnect`] с `correlation_id`, который пробрасывается
 /// в каждое входящее событие через [`tunnel::dispatch_incoming_correlated`].
+///
+/// ADR-0005 / ADR-0003: addin — только транспорт, поэтому `system_capability`
+/// больше не нужен. Spawn/kill живут в test_client tools и идут обычными
+/// `tools/call`-фреймами через `external_event`.
 pub async fn run_with_reconnect_correlated<C>(
     connector: C,
     host: Arc<dyn AddinHost>,
@@ -148,14 +157,29 @@ where
 {
     let emitter = StateEmitter { host: host.clone() };
     let mut attempt: u32 = 0;
+    // #97: уникальный run_id для трассировки отдельной reconnect-task в
+    // tracing-логе — иначе при наличии «зомби» старой task их события в
+    // одном файле не различишь. Round-2 fix: монотонный счётчик вместо
+    // Instant::now().elapsed() (который у только что созданного Instant
+    // даёт ~единицы наносекунд → почти константа).
+    static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let run_id: u64 = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(run_id, "run_with_reconnect: started");
 
     loop {
         if cancel.is_cancelled() {
+            tracing::info!(run_id, attempt, "run_with_reconnect: cancelled at loop top");
             return FinalOutcome::Cancelled;
         }
 
         attempt = attempt.saturating_add(1);
+        tracing::info!(run_id, attempt, "reconnect_fired");
         emitter.connecting(attempt);
+        // Async-yield после emit'а — на Linux 1С 8.3.27 платформа теряет
+        // быстрые подряд external_event из background-потока tokio runtime,
+        // если между ними не было передачи управления планировщику. См.
+        // `feedback_addin_external_event_linux.md` в memory.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let connect_result = tokio::select! {
             biased;
@@ -167,6 +191,7 @@ where
             Ok((inbound, sink)) => {
                 attempt = 0; // перезапускаем счётчик на следующую серию неудач
                 emitter.connected();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
                 let outcome = run_tunnel_with_correlation(
                     inbound,
@@ -182,6 +207,7 @@ where
                     RunOutcome::Cancelled => return FinalOutcome::Cancelled,
                     RunOutcome::OutboundDropped => {
                         emitter.disconnected("OutboundDropped");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         return FinalOutcome::OutboundDropped;
                     }
                     RunOutcome::Closed => "Closed",
@@ -189,14 +215,17 @@ where
                     RunOutcome::SinkError => "SinkError",
                 };
                 emitter.disconnected(reason);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 // переход к новой попытке connect — без backoff,
                 // потому что attempt сброшен и delay_for(1) применится ниже.
             }
             Err(err) => {
                 emitter.disconnected(&format!("ConnectError: {err:?}"));
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if let Some(max) = policy.max_attempts {
                     if attempt >= max {
                         emitter.give_up("max attempts exceeded");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         return FinalOutcome::GiveUp;
                     }
                 }
@@ -204,9 +233,13 @@ where
         }
 
         let delay = policy.delay_for(attempt);
+        tracing::info!(run_id, attempt, delay_ms = delay.as_millis() as u64, "reconnect_scheduled");
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return FinalOutcome::Cancelled,
+            _ = cancel.cancelled() => {
+                tracing::info!(run_id, attempt, "run_with_reconnect: cancelled during backoff");
+                return FinalOutcome::Cancelled;
+            }
             _ = tokio::time::sleep(delay) => {}
         }
     }
@@ -385,8 +418,9 @@ mod tests {
             run_with_reconnect(connector, host_dyn, outbound, cancel_clone, policy).await
         });
 
-        // Дать достаточно времени на цикл reconnect.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Дать достаточно времени на цикл reconnect (включая 100мс
+        // async-sleep'ы между emit'ами в `run_with_reconnect_correlated`).
+        tokio::time::sleep(Duration::from_millis(500)).await;
         cancel.cancel();
         let outcome = pump.await.unwrap();
         assert_eq!(outcome, FinalOutcome::Cancelled);

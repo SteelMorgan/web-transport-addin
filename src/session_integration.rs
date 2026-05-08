@@ -41,7 +41,7 @@ use crate::tunnel::{OutboundSender, SendError, TextOrClose};
 pub struct SessionIntegration {
     cancel: CancellationToken,
     outbound: OutboundSender,
-    task: JoinHandle<FinalOutcome>,
+    task: Option<JoinHandle<FinalOutcome>>,
 }
 
 impl SessionIntegration {
@@ -75,6 +75,11 @@ impl SessionIntegration {
         let (outbound_tx, outbound_rx) = unbounded_channel::<String>();
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
+
+        // ADR-0005 / ADR-0003: spawn-supervisor (system_capability registry)
+        // удалён — spawn/kill живут в test_client tools и не требуют поддержки
+        // в транспорте.
+
         let task = runtime.spawn(async move {
             run_with_reconnect_correlated(
                 connector,
@@ -89,7 +94,7 @@ impl SessionIntegration {
         Self {
             cancel,
             outbound: OutboundSender::new(outbound_tx),
-            task,
+            task: Some(task),
         }
     }
 
@@ -127,9 +132,28 @@ impl SessionIntegration {
     }
 
     /// Сигнализировать остановку. Вызов consume'ит handle.
-    pub fn shutdown(self) -> JoinHandle<FinalOutcome> {
+    pub fn shutdown(mut self) -> JoinHandle<FinalOutcome> {
+        tracing::info!("SessionIntegration::shutdown — cancelling token and returning task handle");
         self.cancel.cancel();
+        // Take the JoinHandle so Drop импл ничего не abort'ит дополнительно.
         self.task
+            .take()
+            .expect("SessionIntegration::task already taken")
+    }
+}
+
+// #97: гарантировать abort фоновой reconnect/tunnel task при дропе integration.
+// Без этого при close DRIVE (когда BSL не вызвал session.stop) старая task
+// остаётся жить в runtime, и дроп runtime блокируется до её завершения.
+// Если task висит в `connect_async` (наблюдалось на Windows при быстром
+// re-open DRIVE), runtime drop тормозит дроп всего addin'а.
+impl Drop for SessionIntegration {
+    fn drop(&mut self) {
+        if let Some(handle) = self.task.take() {
+            tracing::info!("SessionIntegration::drop — cancelling token and aborting task");
+            self.cancel.cancel();
+            handle.abort();
+        }
     }
 }
 
@@ -156,7 +180,50 @@ impl Connector for WsConnector {
     fn connect(&self) -> Self::ConnectFut {
         let url = self.url.clone();
         Box::pin(async move {
-            let (ws, _resp) = connect_async(&url).await?;
+            // #97: diagnostic-first — каждая фаза WS-handshake'а должна оставлять
+            // явный след в tracing-логе. Без этого баг «TCP ESTAB, Upgrade не ушёл»
+            // невидим в самих логах addin'а (приходится ходить в `ss -tnp` на
+            // менеджере). См. tasks/97-ws-handshake-blocker/initial-notes.md.
+            let t0 = std::time::Instant::now();
+            tracing::info!(url = %url, phase = "upgrade_send_start", "WsConnector: calling connect_async");
+            let connect_fut = connect_async(&url);
+            let (ws, resp) = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                connect_fut,
+            )
+            .await
+            {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        url = %url,
+                        phase = "upgrade_failed",
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        error = ?e,
+                        "WsConnector: connect_async failed"
+                    );
+                    return Err(e);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        url = %url,
+                        phase = "upgrade_timeout",
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        "WsConnector: connect_async timed out (5s) — TCP up but no Upgrade response"
+                    );
+                    return Err(WsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connect_async timed out (5s)",
+                    )));
+                }
+            };
+            tracing::info!(
+                url = %url,
+                phase = "ws_open",
+                status = %resp.status(),
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "WsConnector: WS upgrade succeeded"
+            );
             let (sink, stream) = ws.split();
             Ok((WsStreamAdapter { inner: stream }, WsSinkAdapter { inner: sink }))
         })
@@ -344,8 +411,9 @@ mod tests {
             policy,
         );
 
-        // Дать pump'у обработать входящее сообщение.
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Дать pump'у обработать входящее сообщение (включая 100мс
+        // async-sleep'ы между emit'ами connecting/connected в reconnect.rs).
+        tokio::time::sleep(Duration::from_millis(400)).await;
 
         // Слать исходящее в активную сессию (вторая Step::OkPending уже стала текущей,
         // но первая сессия закрылась после Ok(frames)+иссякания → reconnect → второй sink_tx).

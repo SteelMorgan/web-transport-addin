@@ -116,6 +116,11 @@ where
 }
 
 /// Вариант [`run_tunnel`] с возможной обёрткой входящих в `correlation_id`-конверт.
+///
+/// ADR-0005 / ADR-0003: addin — это **только транспорт**. Spawn/kill вынесены в
+/// прикладное расширение test_client (BSL tools `system_spawn_1c_client` /
+/// `system_kill_pid`); прежний роутинг `addin.*` через `system_capability`
+/// удалён.
 pub async fn run_tunnel_with_correlation<R, W, EIn, EOut>(
     mut inbound: R,
     sink: W,
@@ -424,4 +429,9 @@ mod tests {
         drop(rx);
         assert_eq!(s.send("x".to_owned()), Err(SendError::Closed));
     }
+
+    // system_capability-интеграционные тесты удалены вместе с механизмом
+    // (ADR-0005 / ADR-0003): spawn/kill теперь живут в test_client tools,
+    // перехватчика `addin.*` в транспорте больше нет.
 }
+
